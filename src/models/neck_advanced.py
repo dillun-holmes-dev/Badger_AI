@@ -69,17 +69,20 @@ class BiFPN(nn.Module):
 
         ch = self.reduce_channels
 
-        # Top-down pathway (P5 → P4 → P3)
+        # Resize operations for cross-scale connections
         self.p5_to_p4 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.p4_td_conv = C2f(ch * 2, ch, n(3), shortcut=False)
         self.p4_to_p3 = nn.Upsample(scale_factor=2, mode='nearest')
-        self.p3_td_conv = C2f(ch * 2, ch, n(3), shortcut=False)
-
-        # Bottom-up pathway (P3 → P4 → P5)
         self.p3_to_p4 = Conv(ch, ch, 3, 2)
-        self.p4_bu_conv = C2f(ch * 2, ch, n(3), shortcut=False)
         self.p4_to_p5 = Conv(ch, ch, 3, 2)
-        self.p5_bu_conv = C2f(ch * 2, ch, n(3), shortcut=False)
+
+        # Post-fusion processing: simple conv (not C2f) because
+        # weighted fusion already produces ch channels (not 2*ch).
+        # BiFPN paper uses depthwise separable conv here; we use
+        # standard Conv for simplicity — can upgrade to DWConv for edge.
+        self.p4_td_conv = Conv(ch, ch, 3, 1)
+        self.p3_td_conv = Conv(ch, ch, 3, 1)
+        self.p4_bu_conv = Conv(ch, ch, 3, 1)
+        self.p5_bu_conv = Conv(ch, ch, 3, 1)
 
         # Learned fusion weights (fast normalized fusion: w / Σw)
         # Each fusion node has 2 inputs → 2 weights

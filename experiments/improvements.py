@@ -630,6 +630,111 @@ EXPERIMENTS = {
         'paper': 'Huang et al., "Stochastic Depth", ECCV 2016 — arXiv:1603.09382',
         'benchmark': '+0.5-1.0% top-1 ImageNet, reduces overfitting in deep nets',
     },
+
+    # =========================================================================
+    # v2 EXPERIMENTS — State-of-the-Art (2023-2026)
+    # =========================================================================
+
+    'wiou_v3': {
+        'name': 'WIoU v3 Box Loss',
+        'description': 'Dynamic non-monotonic focusing — replaces CIoU for superior gradient quality',
+        'expected_gain': '+0.5-1.5% mAP',
+        'param_overhead': '0%',
+        'speed_cost': 'Same as CIoU',
+        'paper': 'Tong et al., "Wise-IoU: Bounding Box Regression Loss with Dynamic Focusing Mechanism" (2023) — arXiv:2301.10051',
+        'benchmark': '+0.7 AP COCO val2017 (YOLOv7-tiny, 640, FP32)',
+        'version': 'v2',
+    },
+    'inner_iou': {
+        'name': 'Inner-IoU Loss',
+        'description': 'Auxiliary bounding box regression — improves small object accuracy',
+        'expected_gain': '+0.3-0.8% mAP (especially AP_S)',
+        'param_overhead': '0%',
+        'speed_cost': 'Same as CIoU',
+        'paper': 'Zhang et al., "Inner-IoU: More Effective Bounding Box Regression" (2023) — arXiv:2311.02877',
+        'benchmark': '+0.5 AP, +0.8 AP_S on COCO val2017 (YOLOv5s, 640)',
+        'version': 'v2',
+    },
+    'focal_eiou': {
+        'name': 'Focal-EIoU Loss',
+        'description': 'Focal-weighted Efficient IoU — focuses on hard samples during training',
+        'expected_gain': '+0.3-0.5% mAP',
+        'param_overhead': '0%',
+        'speed_cost': 'Same',
+        'paper': 'Zhang et al., "Focal and Efficient IOU Loss" (2021) — arXiv:2101.08158',
+        'benchmark': '+0.3 AP COCO val2017 (Faster R-CNN + ResNet-50)',
+        'version': 'v2',
+    },
+    'pconv_backbone': {
+        'name': 'PConv Backbone (FasterNet)',
+        'description': 'Partial Convolution — process only 25% of channels, 75% FLOPs savings',
+        'expected_gain': 'Same accuracy, 2-3× faster inference',
+        'param_overhead': '-30% (fewer params)',
+        'speed_cost': '2-3× faster',
+        'paper': 'Chen et al., "Run, Don\'t Walk: Chasing Higher FLOPS" (CVPR 2023) — arXiv:2303.03667',
+        'benchmark': 'FasterNet-T0: 71.9% top-1 ImageNet-1k, 0.34 GFLOPs',
+        'version': 'v2',
+    },
+    'c2f_cib': {
+        'name': 'C2f with Compact Inverted Bottleneck',
+        'description': 'Replace standard 3×3 convs with depthwise conv chains — 20% smaller',
+        'expected_gain': '-20% params, same accuracy',
+        'param_overhead': '-20%',
+        'speed_cost': '~15% faster',
+        'paper': 'Wang et al., "YOLOv10: Real-Time End-to-End Object Detection" (2024) — arXiv:2405.14458',
+        'benchmark': 'YOLOv10-S: 46.3 AP, 7.2M params (vs YOLOv8-S: 44.9 AP, 11.2M)',
+        'version': 'v2',
+    },
+    'repc2f': {
+        'name': 'Reparameterizable C2f',
+        'description': 'Multi-branch training → single conv at deploy. Free accuracy boost.',
+        'expected_gain': '+0.5-1.0% mAP, zero inference cost',
+        'param_overhead': '3× during training, 0× at deploy',
+        'speed_cost': 'Zero inference cost (fused)',
+        'paper': 'Ding et al., "RepVGG" (CVPR 2021) + YOLOv10 (2024)',
+        'benchmark': '+1-3 AP over plain conv, zero deploy overhead',
+        'version': 'v2',
+    },
+    'nms_free': {
+        'name': 'NMS-Free Dual-Head Detection',
+        'description': 'one2many (training) + one2one (inference) — eliminates NMS entirely',
+        'expected_gain': 'Same accuracy, removes NMS latency (~1-5ms savings)',
+        'param_overhead': '~30% (dual head during training)',
+        'speed_cost': 'Faster inference (no NMS post-processing)',
+        'paper': 'Wang et al., "YOLOv10" (arXiv:2405.14458) — Consistent Dual Assignments',
+        'benchmark': 'YOLOv10: NMS-free, -2ms latency vs YOLOv8 on COCO val2017',
+        'version': 'v2',
+    },
+    'bifpn_v2': {
+        'name': 'BiFPN v2 (Proper Weighted Fusion)',
+        'description': 'Fast normalized weighted element-wise fusion — correct EfficientDet implementation',
+        'expected_gain': '+0.5-1.5% mAP over concat-based BiFPN',
+        'param_overhead': 'Minimal (learnable weights only)',
+        'speed_cost': '~5% slower than PAFPN',
+        'paper': 'Tan et al., "EfficientDet" (CVPR 2020) — arXiv:1911.09070',
+        'benchmark': 'EfficientDet-D0: 33.8 AP (COCO) vs plain FPN: 32.2 AP',
+        'version': 'v2',
+    },
+    'area_attention': {
+        'name': 'Area Attention (A²)',
+        'description': 'Partition-based efficient attention — large receptive field at O(N√N) cost',
+        'expected_gain': '+1.0-2.0% mAP for large models',
+        'param_overhead': '~10%',
+        'speed_cost': '~15% slower',
+        'paper': 'Tian et al., "YOLOv12: Attention-Centric Real-Time Object Detectors" (2025) — arXiv:2502.12524',
+        'benchmark': 'YOLOv12-L: 53.7 AP COCO val2017 (vs YOLOv11-L: 53.4 AP)',
+        'version': 'v2',
+    },
+    'r_elan': {
+        'name': 'R-ELAN Block',
+        'description': 'Residual ELAN for stable training of attention-heavy models',
+        'expected_gain': 'Enables stable training of deeper attention models',
+        'param_overhead': '~5%',
+        'speed_cost': '~5% slower',
+        'paper': 'Tian et al., "YOLOv12" (arXiv:2502.12524) — Section 3.2',
+        'benchmark': 'Stabilizes training for 50+ attention layers',
+        'version': 'v2',
+    },
 }
 
 # =============================================================================
@@ -709,6 +814,32 @@ def fast_preset():
     )
 
 
+# --- v2 Presets (State-of-the-Art) ---
+
+def sota_v2_preset():
+    """Full SOTA stack for maximum accuracy. Target: 60+ mAP on COCO."""
+    return build_combo(
+        'wiou_v3', 'repc2f', 'c2f_cib', 'bifpn_v2', 'nms_free',
+        'varifocal_loss', 'ema_weights', 'mosaic_close',
+        'multi_scale_training', 'area_attention'
+    )
+
+
+def edge_v2_preset():
+    """Maximum efficiency for edge deployment. Target: 35+ mAP, <2ms latency."""
+    return build_combo(
+        'pconv_backbone', 'c2f_cib', 'wiou_v3', 'nms_free', 'ema_weights'
+    )
+
+
+def balanced_v2_preset():
+    """Best accuracy/speed tradeoff with v2 techniques. Target: 50-55 mAP."""
+    return build_combo(
+        'wiou_v3', 'repc2f', 'bifpn_v2', 'nms_free',
+        'varifocal_loss', 'ema_weights', 'mosaic_close'
+    )
+
+
 # =============================================================================
 # Paper Reference Index
 # =============================================================================
@@ -753,6 +884,15 @@ PAPERS = {
     'Generalized Focal Loss':  'https://arxiv.org/abs/2006.04388',
     'VarifocalNet (2020)':     'https://arxiv.org/abs/2008.13367',
     'SIoU Loss (2022)':        'https://arxiv.org/abs/2205.12740',
+    'WIoU (2023)':             'https://arxiv.org/abs/2301.10051',
+    'Inner-IoU (2023)':        'https://arxiv.org/abs/2311.02877',
+
+    # Efficient architectures (2023-2026)
+    'FasterNet/PConv (2023)':  'https://arxiv.org/abs/2303.03667',
+    'YOLOv10 (2024)':          'https://arxiv.org/abs/2405.14458',
+    'YOLOv12 (2025)':          'https://arxiv.org/abs/2502.12524',
+    'EfficientDet (2020)':     'https://arxiv.org/abs/1911.09070',
+    'RepVGG (2021)':           'https://arxiv.org/abs/2101.03697',
 
     # Multimodal / self-supervised
     'CLIP (2021)':             'https://arxiv.org/abs/2103.00020',
