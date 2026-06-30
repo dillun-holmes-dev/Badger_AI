@@ -1,13 +1,9 @@
 """
-Loss functions package.
+🦡 Badger AI — Unified Loss Functions.
 
-v1: Standard losses (CIoU, BCE, DFL)
-v2: State-of-the-art losses (WIoU v3, Inner-IoU, Focal-EIoU)
+All losses in one clean package. No v1/v2 split.
 """
-# --- v1 Losses ---
 from .badger_loss import BadgerLoss, ciou_loss, dfl_loss, TaskAlignedAssigner, SimOTAAssigner
-from .advanced_losses import GaussianDFL, VarifocalLoss, siou_loss
-
-# --- v2 Losses (state-of-the-art) ---
-from .sota_losses import wiou_loss, inner_iou_loss, focal_eiou_loss, compute_box_loss
-
+from .advanced_losses import (GaussianDFL, VarifocalLoss, siou_loss,
+                               wiou_v3_loss, inner_iou_loss,
+                               focal_eiou_loss, compute_box_loss)

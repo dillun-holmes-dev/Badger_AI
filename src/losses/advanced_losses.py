@@ -530,3 +530,125 @@ def inner_iou_loss(pred_boxes, target_boxes, inner_scale=0.75,
         return inner_ciou.mean()
 
     return (1.0 - iou_inner).mean()
+
+# =============================================================================
+# 3. Focal-EIoU — Focal Efficient IoU
+# =============================================================================
+
+def focal_eiou_loss(pred_boxes, target_boxes, xywh=True, gamma=0.5, eps=1e-7):
+    """
+    Focal-EIoU Loss — combines Efficient IoU with focal weighting.
+
+    EIoU = 1 - IoU + d²/c² + (Δw)²/C_w² + (Δh)²/C_h²
+
+    Focal-EIoU adds: multiply by IoU^γ to focus on hard samples.
+      Focal-EIoU = IoU^γ × EIoU
+
+    The γ parameter controls how much we focus:
+      - γ=0: standard EIoU (uniform weighting)
+      - γ=0.5: moderate focus on hard samples (default)
+      - γ=1.0: strong focus on hard samples
+
+    Reference: Zhang et al., "Focal and Efficient IOU Loss for Accurate
+               Bounding Box Regression" (arXiv:2101.08158)
+    """
+    if xywh:
+        p_x1 = pred_boxes[..., 0] - pred_boxes[..., 2] / 2
+        p_y1 = pred_boxes[..., 1] - pred_boxes[..., 3] / 2
+        p_x2 = pred_boxes[..., 0] + pred_boxes[..., 2] / 2
+        p_y2 = pred_boxes[..., 1] + pred_boxes[..., 3] / 2
+
+        t_x1 = target_boxes[..., 0] - target_boxes[..., 2] / 2
+        t_y1 = target_boxes[..., 1] - target_boxes[..., 3] / 2
+        t_x2 = target_boxes[..., 0] + target_boxes[..., 2] / 2
+        t_y2 = target_boxes[..., 1] + target_boxes[..., 3] / 2
+    else:
+        p_x1, p_y1, p_x2, p_y2 = pred_boxes.chunk(4, dim=-1)
+        t_x1, t_y1, t_x2, t_y2 = target_boxes.chunk(4, dim=-1)
+        p_x1, p_y1, p_x2, p_y2 = [x.squeeze(-1) for x in [p_x1, p_y1, p_x2, p_y2]]
+        t_x1, t_y1, t_x2, t_y2 = [x.squeeze(-1) for x in [t_x1, t_y1, t_x2, t_y2]]
+
+    # IoU
+    inter_x1 = torch.max(p_x1, t_x1)
+    inter_y1 = torch.max(p_y1, t_y1)
+    inter_x2 = torch.min(p_x2, t_x2)
+    inter_y2 = torch.min(p_y2, t_y2)
+    inter_area = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+
+    p_area = (p_x2 - p_x1) * (p_y2 - p_y1)
+    t_area = (t_x2 - t_x1) * (t_y2 - t_y1)
+    union = p_area + t_area - inter_area + eps
+    iou = inter_area / union
+
+    # Center distance
+    p_cx = (p_x1 + p_x2) / 2
+    p_cy = (p_y1 + p_y2) / 2
+    t_cx = (t_x1 + t_x2) / 2
+    t_cy = (t_y1 + t_y2) / 2
+    center_dist2 = (p_cx - t_cx) ** 2 + (p_cy - t_cy) ** 2
+
+    # Enclosing box
+    enc_x1 = torch.min(p_x1, t_x1)
+    enc_y1 = torch.min(p_y1, t_y1)
+    enc_x2 = torch.max(p_x2, t_x2)
+    enc_y2 = torch.max(p_y2, t_y2)
+    enc_diag2 = (enc_x2 - enc_x1) ** 2 + (enc_y2 - enc_y1) ** 2 + eps
+
+    # EIoU: separate width and height penalties
+    p_w = p_x2 - p_x1
+    p_h = p_y2 - p_y1
+    t_w = t_x2 - t_x1
+    t_h = t_y2 - t_y1
+
+    enc_w = enc_x2 - enc_x1
+    enc_h = enc_y2 - enc_y1
+
+    eiou = 1 - iou + center_dist2 / enc_diag2 + \
+           (p_w - t_w) ** 2 / (enc_w ** 2 + eps) + \
+           (p_h - t_h) ** 2 / (enc_h ** 2 + eps)
+
+    # Focal weighting: IoU^γ × EIoU
+    # Lower IoU (harder samples) get higher weight
+    focal_weight = iou.detach().clamp(0, 1) ** gamma
+    loss = focal_weight * eiou
+
+    return loss.mean()
+
+
+
+# =============================================================================
+# 4. Unified Box Loss Interface
+# =============================================================================
+
+def compute_box_loss(pred_boxes, target_boxes, loss_type='wiou', xywh=True, **kwargs):
+    """
+    Unified interface for all box regression losses.
+
+    Args:
+        pred_boxes: [N, 4] predicted boxes
+        target_boxes: [N, 4] ground truth boxes
+        loss_type: 'ciou', 'wiou', 'inner_iou', 'focal_eiou', 'siou'
+        xywh: box format
+
+    Returns:
+        loss: scalar
+    """
+    if loss_type == 'wiou':
+        return wiou_loss(pred_boxes, target_boxes, xywh=xywh,
+                        mode=kwargs.get('wiou_mode', 'v3'))
+    elif loss_type == 'inner_iou':
+        return inner_iou_loss(pred_boxes, target_boxes, xywh=xywh,
+                             ratio=kwargs.get('inner_ratio', 0.7))
+    elif loss_type == 'focal_eiou':
+        return focal_eiou_loss(pred_boxes, target_boxes, xywh=xywh,
+                              gamma=kwargs.get('focal_gamma', 0.5))
+    elif loss_type == 'siou':
+        # siou_loss: defined above
+        return siou_loss(pred_boxes, target_boxes)
+    elif loss_type == 'ciou':
+        from .badger_loss import ciou_loss
+        return ciou_loss(pred_boxes, target_boxes, xywh=xywh)
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}. "
+                        f"Options: ciou, wiou, inner_iou, focal_eiou, siou")
+
