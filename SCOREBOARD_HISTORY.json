@@ -1,0 +1,10 @@
+{
+  "_description": "Append-only scoreboard. Every benchmark run — accepted or rejected — gets a new entry. The entire improvement trajectory is auditable from this single file.",
+  "_rules": [
+    "Never delete or modify previous entries — only append",
+    "Each entry must include git commit hash and exact run command",
+    "mAP = COCO val2017 mAP@0.5:0.95 unless otherwise noted",
+    "Latency = PyTorch FP32 on reference hardware (specify which)"
+  ],
+  "entries": []
+}

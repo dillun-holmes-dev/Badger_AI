@@ -1,0 +1,103 @@
+# =============================================================================
+# Badger AI — Default Configuration
+# =============================================================================
+# This YAML file controls every aspect of training and model architecture.
+# You can create variants (e.g., config/experimental.yaml) for experiments.
+
+model:
+  # Backbone: the feature extractor
+  backbone:
+    type: "cspdarknet"        # Options: cspdarknet, efficientnet, mobilenet, resnet
+    depth_multiple: 0.33      # Scales number of layers (nano=0.33, small=0.33, medium=0.67, large=1.0)
+    width_multiple: 0.25       # Scales number of channels (nano=0.25, small=0.50, medium=0.75, large=1.0)
+    act: "silu"               # Activation: silu (Swish), relu, mish
+
+  # Neck: feature pyramid that fuses multi-scale features
+  neck:
+    type: "pafpn"             # Options: pafpn (Badger default), bifpn, panet
+    num_fpn_layers: 3         # Number of FPN output scales (P3, P4, P5)
+
+  # Head: detection head that predicts boxes and classes
+  head:
+    type: "decoupled"         # Options: decoupled (Badger default), coupled
+    num_classes: 80           # COCO: 80, VOC: 20 — change for your dataset
+    reg_max: 16               # DFL regression range (Badger uses 16)
+
+  # Anchors (only used if head.type is anchor-based)
+  anchors:
+    - [[10, 13], [16, 30], [33, 23]]     # P3/8 (small objects)
+    - [[30, 61], [62, 45], [59, 119]]    # P4/16 (medium objects)
+    - [[116, 90], [156, 198], [373, 326]] # P5/32 (large objects)
+
+training:
+  # Image size — YOLOv8 uses 640, but you can use 416 for speed or 1280 for accuracy
+  img_size: 640
+  batch_size: 16              # Adjust based on your GPU memory
+  epochs: 300
+  warmup_epochs: 3            # Gradual learning rate warmup
+  
+  # Optimizer
+  optimizer: "adamw"          # Options: sgd, adam, adamw
+  lr: 0.001                   # Initial learning rate (SGD: 0.01, AdamW: 0.001)
+  weight_decay: 0.0005
+  momentum: 0.937             # Only for SGD
+  
+  # Learning rate schedule
+  lr_scheduler: "cosine"      # Options: cosine, step, plateau
+  lr_final: 0.0001            # Final LR as fraction of initial (0.01 = 1%)
+
+  # Loss weights — tune these to balance the three loss components
+  loss:
+    box_weight: 7.5           # CIoU box regression loss
+    cls_weight: 0.5           # BCE classification loss
+    dfl_weight: 1.5           # Distribution focal loss (anchor-free only)
+    assigner: "tal"           # Label assigner: "tal" (YOLOv8-style) or "simota" (YOLOX-style)
+
+  # Augmentation (applied during training)
+  augmentation:
+    mosaic: 1.0               # Probability of mosaic augmentation (4 images → 1)
+    mixup: 0.1                # Probability of mixup augmentation
+    hsv_h: 0.015              # Hue shift
+    hsv_s: 0.7                # Saturation scale
+    hsv_v: 0.4                # Value scale
+    degrees: 0.0              # Rotation (±degrees)
+    translate: 0.1            # Translation (±fraction)
+    scale: 0.5                # Scale gain
+    shear: 0.0                # Shear (±degrees)
+    perspective: 0.0          # Perspective distortion
+    flip_lr: 0.5              # Left-right flip probability
+    flip_ud: 0.0              # Up-down flip probability
+
+  # Regularization
+  dropout: 0.0                # Dropout in classification head
+  label_smoothing: 0.0        # Label smoothing epsilon
+
+data:
+  # Path to your dataset YAML (COCO format expected)
+  dataset_yaml: "config/coco.yaml"
+  num_workers: 8              # DataLoader workers
+
+# Validation & testing
+val:
+  conf_threshold: 0.001       # Confidence threshold for NMS
+  iou_threshold: 0.65         # NMS IoU threshold
+  max_det: 300                # Max detections per image
+
+# Logging
+logging:
+  log_dir: "runs/"
+  tensorboard: true
+  wandb: false                # Set to true if you have wandb installed
+  save_interval: 10           # Save checkpoint every N epochs
+
+# =============================================================================
+# Improvement Ideas — things to try to beat YOLO
+# =============================================================================
+# 1. SimOTA assigner: set training.loss.assigner to "simota" (from YOLOX)
+# 2. BiFPN neck: set model.neck.type to "bifpn" (EfficientDet-style)
+# 3. Attention modules: add CBAM/ECA attention in backbone
+# 4. Larger resolution: increase img_size to 1280
+# 5. EMA: exponential moving average of weights
+# 6. Multi-scale training: random resize during training
+# 7. Knowledge distillation: train a small Badger from a large one
+# 8. GIoU loss: alternative to CIoU for box regression

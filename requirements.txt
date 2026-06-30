@@ -1,0 +1,28 @@
+# Badger AI — YOLOv8-inspired Object Detection from Scratch
+#
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+pyyaml>=6.0
+tqdm>=4.65.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+tensorboard>=2.13.0
+
+# Data & augmentations
+albumentations>=1.3.0
+pycocotools>=2.0.7
+
+# Experiment tracking (optional but recommended)
+wandb>=0.15.0
+
+# Inference optimization (optional)
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Development
+ipykernel>=6.25.0
+jupyter>=1.0.0
