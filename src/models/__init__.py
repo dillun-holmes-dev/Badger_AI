@@ -24,5 +24,7 @@ from .neck import PAFPN
 from .neck_advanced import BiFPN, ASFF, NASFPN
 from .head import DecoupledHead, CoupledHead, DualHead, HungarianMatcher, nms_free_postprocess
 from .attention import WindowAttention, SwinBlock, GlobalTokenMixer, AttentionNeck
-from .badger import Badger, create_model, BadgerV2, BackboneV2, BiFPNNeck, DecoupledHeadV2
+from .badger import (Badger, create_model,
+                       BadgerV2, BackboneV2, BiFPNNeck, DecoupledHeadV2,
+                       BiFPNLayer, create_badger_v2, compare_models)
 from .multitask import BadgerMultiTask, KeypointHead, ClassificationHead, create_efficient_model
