@@ -20,22 +20,22 @@ import torch.nn.functional as F
 
 def bbox_iou(box1, box2, xywh=True, eps=1e-7):
     """
-    Calculate IoU between two sets of boxes.
+    Calculate IoU matrix between two sets of boxes.
 
-    Supports multiple IoU variants:
-      - IoU:  standard intersection over union
-      - GIoU: generalized IoU (penalizes non-overlapping boxes)
-      - DIoU: distance IoU (penalizes distant centers)
-      - CIoU: complete IoU (DIoU + aspect ratio penalty) ← YOLOv8 default
+    Adds broadcasting dims so [N,4] vs [M,4] produces [N,M] IoU.
 
     Args:
-        box1: [N, 4] or [B, N, 4]
-        box2: [M, 4] or [B, M, 4]
+        box1: [N, 4] in (cx, cy, w, h) format
+        box2: [M, 4] in (cx, cy, w, h) format
         xywh: if True, boxes are in (cx, cy, w, h) format
 
     Returns:
-        IoU matrix [N, M] or [B, N, M]
+        IoU matrix [N, M]
     """
+    # Add broadcast dimensions: [N, 1, 4] vs [1, M, 4]
+    box1 = box1.unsqueeze(1)
+    box2 = box2.unsqueeze(0)
+
     # Convert from (cx, cy, w, h) to (x1, y1, x2, y2)
     if xywh:
         b1_x1 = box1[..., 0] - box1[..., 2] / 2
@@ -51,7 +51,7 @@ def bbox_iou(box1, box2, xywh=True, eps=1e-7):
         b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, dim=-1)
         b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, dim=-1)
 
-    # Intersection area
+    # Intersection area — broadcasting gives [N, M]
     inter_x1 = torch.max(b1_x1, b2_x1)
     inter_y1 = torch.max(b1_y1, b2_y1)
     inter_x2 = torch.min(b1_x2, b2_x2)
@@ -63,8 +63,7 @@ def bbox_iou(box1, box2, xywh=True, eps=1e-7):
     b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
     union_area = b1_area + b2_area - inter_area + eps
 
-    iou = inter_area / union_area
-    return iou
+    return inter_area / union_area  # [N, M]
 
 
 def ciou_loss(pred_boxes, target_boxes, xywh=True, eps=1e-7):

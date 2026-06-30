@@ -1,7 +1,9 @@
 """
 Model package — exports all model components.
 """
-from .blocks import Conv, Bottleneck, C2f, SPPF, DFL
+from .blocks import (Conv, Bottleneck, C2f, SPPF, DFL,
+                     GhostConv, DepthwiseSeparableConv, GhostBottleneck,
+                     GhostC2f, HardSwish, LightweightDetectHead)
 from .backbone import CSPDarknet
 from .neck import PAFPN
 from .neck_advanced import BiFPN, ASFF, NASFPN
