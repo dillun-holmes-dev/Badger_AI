@@ -32,13 +32,19 @@ class CSPDarknet(nn.Module):
     The three outputs (P3, P4, P5) feed into the neck/FPN.
     """
 
-    def __init__(self, width_multiple=0.50, depth_multiple=0.33, act="silu"):
+    def __init__(self, width_multiple=0.50, depth_multiple=0.33, act="silu",
+                 use_ghost=False):
         """
         Args:
             width_multiple: scales channel counts (0.25=nano, 0.50=small, 1.0=large)
             depth_multiple: scales number of C2f bottlenecks
+            use_ghost: if True, use GhostC2f instead of C2f (~30% fewer params)
         """
         super().__init__()
+
+        # Choose block type based on efficiency mode
+        from .blocks import GhostC2f
+        BlockType = GhostC2f if use_ghost else C2f
 
         # Base channels — scaled by width_multiple
         base_channels = {
@@ -61,25 +67,25 @@ class CSPDarknet(nn.Module):
 
         # --- Stage 3 ---
         self.stage3 = nn.Sequential(
-            C2f(base_channels['c2'], base_channels['c3'], n(3), shortcut=True),
+            BlockType(base_channels['c2'], base_channels['c3'], n(3), shortcut=True),
             Conv(base_channels['c3'], base_channels['c4'], 3, 2),  # 160 → 80
         )
 
         # --- Stage 4 (P3 output) ---
         self.stage4 = nn.Sequential(
-            C2f(base_channels['c4'], base_channels['c5'], n(6), shortcut=True),
+            BlockType(base_channels['c4'], base_channels['c5'], n(6), shortcut=True),
             Conv(base_channels['c5'], base_channels['c5'], 3, 2),  # 80 → 40
         )
 
         # --- Stage 5 (P4 output) ---
         self.stage5 = nn.Sequential(
-            C2f(base_channels['c5'], base_channels['c5'], n(6), shortcut=True),
+            BlockType(base_channels['c5'], base_channels['c5'], n(6), shortcut=True),
             Conv(base_channels['c5'], base_channels['c6'], 3, 2),  # 40 → 20
         )
 
         # --- Stage 6 (P5 output) ---
         self.stage6 = nn.Sequential(
-            C2f(base_channels['c6'], base_channels['c6'], n(3), shortcut=True),
+            BlockType(base_channels['c6'], base_channels['c6'], n(3), shortcut=True),
             SPPF(base_channels['c6'], base_channels['c6'], kernel_size=5),
         )
 
