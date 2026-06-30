@@ -19,6 +19,7 @@ from .multitask import BadgerMultiTask, KeypointHead, ClassificationHead, create
 # --- v2 Components (state-of-the-art) ---
 from .blocks_v2 import (PConv, PConvBlock, RepVGGBlock, CIB, C2f_CIB,
                          RepBottleneck, RepC2f, AreaAttention, A2Block, RELAN,
+                         DCNv4, DCNBottleneck, GELAN, DyHeadBlock, DyHead,
                          fuse_model_reparam, profile_model, print_profile)
 from .badger_v2 import (BadgerV2, BackboneV2, BiFPNNeck, DecoupledHeadV2,
                          create_badger_v2, compare_models)
