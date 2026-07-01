@@ -19,9 +19,13 @@ model:
 
   # Head: detection head that predicts boxes and classes
   head:
-    type: "decoupled"         # Options: decoupled (Badger default), coupled
+    type: "decoupled"         # Options:
+                              #   decoupled — BatchNorm, 2-conv branches (PROVEN baseline)
+                              #   quality_decoupled — BatchNorm + tiny 1×1 quality piggyback (PROVEN, +0.8% F1 on synthetic)
+                              #   quality_gn — GroupNorm + full quality branch (EXPERIMENTAL, needs large data)
     num_classes: 80           # COCO: 80, VOC: 20 — change for your dataset
-    reg_max: 16               # DFL regression range (Badger uses 16)
+    reg_max: 16               # DFL regression range
+    quality_exp: 1.0          # Quality gating exponent (for quality_decoupled / quality_gn heads)
 
   # Anchors (only used if head.type is anchor-based)
   anchors:
@@ -46,11 +50,12 @@ training:
   lr_scheduler: "cosine"      # Options: cosine, step, plateau
   lr_final: 0.0001            # Final LR as fraction of initial (0.01 = 1%)
 
-  # Loss weights — tune these to balance the three loss components
+  # Loss weights — tune these to balance the four loss components
   loss:
     box_weight: 7.5           # CIoU box regression loss
     cls_weight: 0.5           # BCE classification loss
     dfl_weight: 1.5           # Distribution focal loss (anchor-free only)
+    quality_weight: 1.0       # IoU quality prediction loss (only for quality_decoupled head)
     assigner: "tal"           # Label assigner: "tal" (YOLOv8-style) or "simota" (YOLOX-style)
 
   # Augmentation (applied during training)

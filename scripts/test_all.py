@@ -477,6 +477,340 @@ def test_metrics():
 
 
 # =============================================================================
+# 11. BadgerV2 Models
+# =============================================================================
+
+def test_badger_v2():
+    print("\n--- Test: BadgerV2 Models (all variants) ---")
+    from src.models import create_badger_v2
+
+    variants = ['pico', 'nano', 'tiny', 'small', 'medium', 'large']
+    for variant in variants:
+        try:
+            model = create_badger_v2(variant, num_classes=80)
+            x = torch.randn(1, 3, 640, 640)
+            cls_scores, bbox_preds = model(x)
+            total_params = sum(p.numel() for p in model.parameters())
+            check(len(cls_scores) == 3 and len(bbox_preds) == 3,
+                  f"BadgerV2-{variant}: forward pass ({total_params:,} params)")
+            check(cls_scores[0].shape[1] == 80,
+                  f"BadgerV2-{variant}: cls channels == 80")
+            check(bbox_preds[0].shape[1] == 4,
+                  f"BadgerV2-{variant}: bbox channels == 4")
+        except Exception as e:
+            result.add_fail(f"BadgerV2-{variant}", str(e))
+
+    # Gradient flow
+    model = create_badger_v2('small', num_classes=80)
+    model.train()
+    x = torch.randn(1, 3, 640, 640)
+    cls, bbox = model(x)
+    loss = sum(c.sum() for c in cls) + sum(b.sum() for b in bbox)
+    loss.backward()
+    grad_params = sum(1 for p in model.parameters()
+                      if p.grad is not None and p.grad.abs().sum() > 0)
+    total = sum(1 for p in model.parameters())
+    check(grad_params == total,
+          f"BadgerV2-small: all {total} params have gradients")
+
+    # Param ordering (smaller variant has fewer params)
+    p_nano = sum(p.numel() for p in create_badger_v2('nano').parameters())
+    p_small = sum(p.numel() for p in create_badger_v2('small').parameters())
+    p_large = sum(p.numel() for p in create_badger_v2('large').parameters())
+    check(p_nano < p_small < p_large,
+          f"Param ordering: nano({p_nano:,}) < small({p_small:,}) < large({p_large:,})")
+
+
+def test_nms_free():
+    print("\n--- Test: NMS-Free DualHead ---")
+    from src.models import create_badger_v2
+    from src.models.head import nms_free_postprocess
+
+    model = create_badger_v2('small', num_classes=80, nms_free=True)
+
+    # Training mode returns two output groups
+    model.train()
+    x = torch.randn(1, 3, 640, 640)
+    out = model(x)
+    check(isinstance(out, tuple) and len(out) == 2,
+          "DualHead train: returns 2 output groups")
+    (m_cls, m_bbox), (o_cls, o_bbox) = out
+    check(len(m_cls) == 3 and len(o_cls) == 3,
+          "DualHead train: both heads output 3 scales")
+
+    # Eval mode returns single output (one2one only)
+    model.eval()
+    cls, bbox = model(x)
+    check(len(cls) == 3 and len(bbox) == 3,
+          "DualHead eval: returns cls + bbox (3 scales)")
+
+    # NMS-free post-processing
+    detections = nms_free_postprocess(cls, bbox, conf_threshold=0.001)
+    check(len(detections) == 1, "NMS-free postprocess: 1 result per image")
+    boxes, scores, class_ids = detections[0]
+    check(boxes.ndim == 2 and boxes.shape[1] == 4,
+          f"NMS-free: boxes shape = {boxes.shape}")
+    check(len(scores) == len(class_ids) == len(boxes),
+          "NMS-free: consistent output lengths")
+
+
+def test_pconv_variant():
+    print("\n--- Test: PConv Edge Variant ---")
+    from src.models import create_badger_v2
+
+    model = create_badger_v2('nano', num_classes=80, use_pconv=True)
+    x = torch.randn(1, 3, 640, 640)
+    cls, bbox = model(x)
+    check(len(cls) == 3 and len(bbox) == 3,
+          "BadgerV2-nano-pconv: forward pass works")
+
+    model_std = create_badger_v2('nano', num_classes=80, use_pconv=False)
+    p_pconv = sum(p.numel() for p in model.parameters())
+    p_std = sum(p.numel() for p in model_std.parameters())
+    # PConv variant should have different param count (architecture differs)
+    check(p_pconv != p_std,
+          f"PConv vs standard: different architecture ({p_pconv:,} vs {p_std:,})")
+
+
+def test_reparameterization():
+    print("\n--- Test: Reparameterization ---")
+    from src.models import create_badger_v2
+
+    model = create_badger_v2('small', num_classes=80)
+    model.eval()
+    x = torch.randn(1, 3, 640, 640)
+
+    with torch.no_grad():
+        cls_before, bbox_before = model(x)
+
+    model.fuse_for_deploy()
+
+    with torch.no_grad():
+        cls_after, bbox_after = model(x)
+
+    cls_diff = max((a - b).abs().max().item()
+                   for a, b in zip(cls_before, cls_after))
+    bbox_diff = max((a - b).abs().max().item()
+                    for a, b in zip(bbox_before, bbox_after))
+    check(cls_diff < 1e-4,
+          f"Reparam cls diff < 1e-4 (got {cls_diff:.8f})")
+    check(bbox_diff < 1e-4,
+          f"Reparam bbox diff < 1e-4 (got {bbox_diff:.8f})")
+
+
+# =============================================================================
+# 12. Advanced Loss Dispatch (compute_box_loss)
+# =============================================================================
+
+def test_box_loss_dispatch():
+    print("\n--- Test: compute_box_loss Dispatch ---")
+    from src.losses.advanced_losses import compute_box_loss
+
+    pred = torch.tensor([[0.5, 0.5, 0.2, 0.3], [0.3, 0.3, 0.1, 0.1]])
+    tgt = torch.tensor([[0.5, 0.5, 0.2, 0.3], [0.3, 0.3, 0.1, 0.1]])
+
+    for loss_type in ['wiou', 'inner_iou', 'focal_eiou', 'siou', 'ciou']:
+        try:
+            loss = compute_box_loss(pred, tgt, loss_type=loss_type)
+            check(not torch.isnan(loss) and loss.item() >= 0,
+                  f"compute_box_loss({loss_type}): {loss.item():.6f}")
+        except Exception as e:
+            result.add_fail(f"compute_box_loss({loss_type})", str(e))
+
+    # Perfect match should give near-zero loss
+    for loss_type in ['wiou', 'inner_iou', 'focal_eiou', 'siou', 'ciou']:
+        try:
+            loss = compute_box_loss(pred, tgt, loss_type=loss_type)
+            check(loss.item() < 0.01,
+                  f"compute_box_loss({loss_type}) perfect match ≈ 0 (got {loss.item():.6f})")
+        except Exception as e:
+            result.add_fail(f"compute_box_loss({loss_type}) zero", str(e))
+
+    # Invalid loss type should raise
+    try:
+        compute_box_loss(pred, tgt, loss_type='invalid')
+        result.add_fail("compute_box_loss(invalid)", "Should have raised ValueError")
+    except ValueError:
+        result.add_pass("compute_box_loss(invalid) raises ValueError")
+    except Exception as e:
+        result.add_fail("compute_box_loss(invalid)", str(e))
+
+
+# =============================================================================
+# 13. Advanced Building Blocks
+# =============================================================================
+
+def test_advanced_blocks():
+    print("\n--- Test: Advanced Blocks ---")
+    from src.models.blocks import (
+        PConv, PConvBlock, CIB, C2f_CIB,
+        RepVGGBlock, RepBottleneck, RepC2f,
+        GELAN, DyHeadBlock, DyHead,
+    )
+
+    x64 = torch.randn(2, 64, 40, 40)
+    x128 = torch.randn(2, 128, 40, 40)
+    x256 = torch.randn(2, 256, 20, 20)
+
+    # PConv
+    pconv = PConv(64, 3, n_div=4)
+    y = pconv(x64)
+    check(y.shape == x64.shape, f"PConv shape preserved: {y.shape}")
+
+    # PConvBlock
+    pblock = PConvBlock(64)
+    y = pblock(x64)
+    check(y.shape == x64.shape, f"PConvBlock shape preserved: {y.shape}")
+
+    # CIB
+    cib = CIB(64, 64)
+    y = cib(x64)
+    check(y.shape == x64.shape, f"CIB shape preserved: {y.shape}")
+
+    # C2f_CIB
+    c2f_cib = C2f_CIB(64, 64, num_blocks=2)
+    y = c2f_cib(x64)
+    check(y.shape == x64.shape, f"C2f_CIB shape preserved: {y.shape}")
+
+    # RepVGGBlock (train mode)
+    rep = RepVGGBlock(64, 64)
+    y = rep(x64)
+    check(y.shape == x64.shape, "RepVGGBlock train shape preserved")
+
+    # RepVGGBlock (fuse)
+    rep.eval()
+    with torch.no_grad():
+        y_before = rep(x64)
+    rep.fuse()
+    with torch.no_grad():
+        y_after = rep(x64)
+    diff = (y_before - y_after).abs().max().item()
+    check(diff < 1e-4, f"RepVGGBlock fuse diff < 1e-4 (got {diff:.8f})")
+
+    # RepC2f
+    repc2f = RepC2f(64, 64, num_blocks=2)
+    y = repc2f(x64)
+    check(y.shape == x64.shape, f"RepC2f shape preserved: {y.shape}")
+
+    # RepC2f fuse
+    repc2f.eval()
+    repc2f.fuse()
+    y2 = repc2f(x64)
+    check(y2.shape == x64.shape, "RepC2f fuse preserves shape")
+
+    # GELAN
+    gelan = GELAN(64, 64, num_branches=3)
+    y = gelan(x64)
+    check(y.shape == x64.shape, f"GELAN shape preserved: {y.shape}")
+
+    # DyHeadBlock
+    dyblock = DyHeadBlock(64, num_tasks=2)
+    y = dyblock(x64, task_id=0)
+    check(y.shape == x64.shape, "DyHeadBlock shape preserved")
+
+    # DyHead (full)
+    dyhead = DyHead(num_classes=80, channels=[64, 128, 256], num_blocks=2)
+    features = [x64, x128, x256]
+    cls, bbox = dyhead(features)
+    check(len(cls) == 3, "DyHead outputs 3 cls maps")
+    check(cls[0].shape[1] == 80, f"DyHead cls channels == 80")
+    check(bbox[0].shape[1] == 4, f"DyHead bbox channels == 4")
+
+
+# =============================================================================
+# 14. Experiment Improvements Module
+# =============================================================================
+
+def test_improvements():
+    print("\n--- Test: Improvements Module ---")
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from experiments.improvements import (
+        CBAM, ECA, SEBlock, Mish, GroupNormConv, ModelEMA,
+        DeformableConv2d, RepConv, DropPath,
+        build_combo, random_resize,
+    )
+
+    x = torch.randn(2, 64, 40, 40)
+
+    # CBAM
+    cbam = CBAM(64)
+    y = cbam(x)
+    check(y.shape == x.shape, "CBAM shape preserved")
+
+    # ECA
+    eca = ECA(64)
+    y = eca(x)
+    check(y.shape == x.shape, "ECA shape preserved")
+
+    # SEBlock
+    se = SEBlock(64)
+    y = se(x)
+    check(y.shape == x.shape, "SEBlock shape preserved")
+
+    # Mish
+    mish = Mish()
+    y = mish(x)
+    check(y.shape == x.shape, "Mish shape preserved")
+
+    # GroupNormConv
+    gnc = GroupNormConv(64, 128, 3)
+    y = gnc(x)
+    check(y.shape == (2, 128, 40, 40), f"GroupNormConv output: {y.shape}")
+
+    # ModelEMA
+    model = nn.Conv2d(3, 16, 3, padding=1)
+    ema = ModelEMA(model, decay=0.999)
+    ema.update(model)
+    ema.update(model)
+    ema.apply(model)
+    check(True, "ModelEMA update + apply works")
+
+    # DeformableConv2d
+    dcn = DeformableConv2d(64, 64, 3, padding=1)
+    y = dcn(x)
+    check(y.shape == x.shape, "DeformableConv2d shape preserved")
+
+    # RepConv (training)
+    rep = RepConv(64, 64)
+    y = rep(x)
+    check(y.shape == x.shape, "RepConv train shape preserved")
+
+    # RepConv (deploy=True)
+    rep_deploy = RepConv(64, 64, deploy=True)
+    y = rep_deploy(x)
+    check(y.shape == x.shape, "RepConv deploy=True works")
+
+    # RepConv reparameterize
+    rep.eval()
+    with torch.no_grad():
+        y_before = rep(x)
+    rep.reparameterize()
+    with torch.no_grad():
+        y_after = rep(x)
+    diff = (y_before - y_after).abs().max().item()
+    check(diff < 1e-3, f"RepConv reparameterize diff < 1e-3 (got {diff:.6f})")
+
+    # DropPath
+    dp = DropPath(0.2)
+    dp.train()
+    y = dp(x)
+    check(y.shape == x.shape, "DropPath train shape preserved")
+    dp.eval()
+    y2 = dp(x)
+    check(torch.allclose(y2, x), "DropPath eval is identity")
+
+    # random_resize
+    sizes = [random_resize(640) for _ in range(20)]
+    check(all(s % 32 == 0 for s in sizes), "random_resize: all multiples of 32")
+    check(all(320 <= s <= 1280 for s in sizes), "random_resize: all in [320, 1280]")
+
+    # build_combo
+    combo = build_combo('cbam_attention', 'ema_weights')
+    check('CBAM' in combo['name'] and 'EMA' in combo['name'],
+          f"build_combo: {combo['name'][:50]}...")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -505,21 +839,34 @@ def main():
     test_neck()
     test_head()
 
-    # Full model
+    # Full model (v1)
     test_full_model()
+
+    # Full model (v2)
+    test_badger_v2()
+    test_nms_free()
+    test_pconv_variant()
+    test_reparameterization()
 
     # Losses
     test_losses()
     test_advanced_losses()
+    test_box_loss_dispatch()
 
     # Attention
     test_attention()
+
+    # Advanced blocks
+    test_advanced_blocks()
 
     # Box ops
     test_box_ops()
 
     # Metrics
     test_metrics()
+
+    # Improvements module
+    test_improvements()
 
     return result.summary()
 

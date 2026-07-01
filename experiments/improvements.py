@@ -317,6 +317,7 @@ class RepConv(nn.Module):
                  padding=1, deploy=False):
         super().__init__()
         self.deploy = deploy
+        self.act = nn.SiLU()
 
         if deploy:
             self.rbr_reparam = nn.Conv2d(in_channels, out_channels, kernel_size,
@@ -332,7 +333,6 @@ class RepConv(nn.Module):
                 nn.BatchNorm2d(out_channels),
             )
             self.rbr_identity = nn.BatchNorm2d(in_channels) if in_channels == out_channels and stride == 1 else None
-            self.act = nn.SiLU()
 
     def forward(self, x):
         if self.deploy:
@@ -381,13 +381,14 @@ class RepConv(nn.Module):
         kernel_1x1, bias_1x1 = self._get_fused_kernel_bias(self.rbr_1x1)
         kernel_1x1_padded = torch.nn.functional.pad(kernel_1x1, [1, 1, 1, 1])
 
-        # Identity branch (eye matrix in kernel space, padded)
+        # Identity branch (BN-only: must fuse BN params into identity kernel)
         if self.rbr_identity is not None:
-            identity_kernel = self._get_identity_kernel(
+            identity_kernel, bias_identity = self._get_identity_kernel_bias(
+                self.rbr_identity,
                 self.rbr_3x3[0].in_channels,
-                self.rbr_3x3[0].out_channels
-            ).to(kernel_3x3.device)
-            bias_identity = torch.zeros_like(bias_3x3)
+                self.rbr_3x3[0].out_channels,
+                kernel_3x3.device,
+            )
         else:
             identity_kernel = torch.zeros_like(kernel_3x3)
             bias_identity = torch.zeros_like(bias_3x3)
@@ -420,12 +421,23 @@ class RepConv(nn.Module):
             return fused.weight, fused.bias
         return branch.weight, branch.bias if branch.bias is not None else torch.zeros(branch.weight.shape[0])
 
-    def _get_identity_kernel(self, in_ch, out_ch):
-        """Create an identity kernel for 3×3 conv (center pixel = 1 per channel)."""
-        kernel = torch.zeros(out_ch, in_ch, 3, 3)
+    def _get_identity_kernel_bias(self, bn, in_ch, out_ch, device):
+        """Create identity kernel fused with BN parameters for the BN-only branch."""
+        kernel = torch.zeros(out_ch, in_ch, 3, 3, device=device)
         for i in range(min(in_ch, out_ch)):
             kernel[i, i, 1, 1] = 1.0
-        return kernel
+
+        # Fuse BN: W_fused = I * (gamma / std), b_fused = beta - gamma * mean / std
+        gamma = bn.weight
+        beta = bn.bias
+        mean = bn.running_mean
+        var = bn.running_var
+        eps = bn.eps
+
+        std = (var + eps).sqrt()
+        fused_kernel = kernel * (gamma / std).reshape(-1, 1, 1, 1)
+        fused_bias = beta - gamma * mean / std
+        return fused_kernel, fused_bias
 
 
 # =============================================================================

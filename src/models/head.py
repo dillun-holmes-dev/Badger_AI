@@ -59,26 +59,34 @@ class DecoupledHead(nn.Module):
             nn.init.constant_(cls_branch[-1].bias, -4.0)
             nn.init.constant_(reg_branch[-1].bias, 0.0)
 
-    def forward(self, features):
+    def forward(self, features, return_raw_reg=False):
         """
         Args:
             features: [N3, N4, N5] from neck
                       Shapes: [B, C, 80, 80], [B, C, 40, 40], [B, C, 20, 20]
+            return_raw_reg: if True, also return raw regression outputs
+                           (before DFL softmax) for DFL loss computation
 
         Returns:
             cls_scores: list of [B, num_classes, H, W]
-            bbox_preds: list of [B, 4, H, W]
+            bbox_preds: list of [B, 4, H, W] (decoded via DFL)
+            raw_reg: list of [B, 4*reg_max, H, W] (only if return_raw_reg=True)
         """
         cls_scores = []
         bbox_preds = []
+        raw_reg_outputs = [] if return_raw_reg else None
 
         for i, feat in enumerate(features):
             cls_out = self.cls_branches[i](feat)
-            reg_out = self.reg_branches[i](feat)
-            bbox_out = self.dfl(reg_out)
+            reg_out = self.reg_branches[i](feat)  # [B, 4*reg_max, H, W]
+            bbox_out = self.dfl(reg_out)           # [B, 4, H, W] decoded
             cls_scores.append(cls_out)
             bbox_preds.append(bbox_out)
+            if return_raw_reg:
+                raw_reg_outputs.append(reg_out)
 
+        if return_raw_reg:
+            return cls_scores, bbox_preds, raw_reg_outputs
         return cls_scores, bbox_preds
 
 
@@ -386,3 +394,236 @@ def nms_free_postprocess(cls_scores, bbox_preds, conf_threshold=0.25, max_det=30
         results.append((boxes, scores, class_ids))
 
     return results
+
+
+# =============================================================================
+# DecoupledHeadWithQuality — proven DecoupledHead + tiny quality output
+# =============================================================================
+
+class DecoupledHeadWithQuality(DecoupledHead):
+    """
+    Standard DecoupledHead with a minimal IoU quality prediction piggybacked on.
+
+    KEY INSIGHT: Don't change what works. The DecoupledHead (BatchNorm,
+    Kaiming init, 2-conv branches) is PROVEN to train well (88.9% F1).
+    We add just ONE extra Conv2d per scale that takes the classification
+    branch's intermediate features and predicts a single IoU quality score.
+
+    Architecture per scale (compared to DecoupledHead):
+        Cls branch:  Conv-BN-SiLU(3×3) → Conv-BN-SiLU(3×3) → Conv2d(1×1)→num_classes
+                                                                    │
+        Quality output (NEW):  ──────────────────→ Conv2d(1×1)→1  ← piggybacks
+
+    Overhead: just 64 params per scale (1×1 conv, 64→1) — 192 params total.
+    This is 0.01% of the model — effectively free.
+
+    During inference: score = sigmoid(cls) × sigmoid(quality)^γ
+    This calibrates confidence without disturbing the proven training dynamics.
+    """
+
+    def __init__(self, num_classes=80, channels=None, reg_max=16,
+                 quality_exp=1.0):
+        super().__init__(num_classes=num_classes, channels=channels, reg_max=reg_max)
+        self.quality_exp = quality_exp
+
+        # Tiny quality output heads — one 1×1 conv per scale, piggybacking
+        # on the second-to-last cls branch features (before the final 1×1 conv)
+        self.quality_heads = nn.ModuleList()
+        for ch in (channels or [256, 256, 256]):
+            self.quality_heads.append(nn.Conv2d(ch, 1, 1))
+
+        # Initialize quality bias so sigmoid(bias) ≈ 0.5 initially
+        for qh in self.quality_heads:
+            nn.init.constant_(qh.bias, 0.0)
+
+    def forward(self, features, return_raw_reg=False):
+        """
+        Returns:
+            cls_scores, bbox_preds, quality_scores (, raw_reg)
+        Quality scores are raw logits with shape [B, 1, H, W].
+        Use sigmoid() before multiplying with class scores.
+        """
+        cls_scores = []
+        bbox_preds = []
+        quality_scores = []
+        raw_reg_outputs = [] if return_raw_reg else None
+
+        for i, feat in enumerate(features):
+            # Use the cls branch's intermediate features for quality
+            # cls_branches[i] = Sequential(Conv(ch,ch,3), Conv(ch,ch,3), Conv2d(ch,num_classes,1))
+            cls_branch = self.cls_branches[i]
+            reg_branch = self.reg_branches[i]
+
+            # Get intermediate cls features (after 2 convs, before final 1x1)
+            cls_feat = cls_branch[0](feat)   # Conv 1
+            cls_feat = cls_branch[1](cls_feat)  # Conv 2
+            cls_out = cls_branch[2](cls_feat)   # Final 1x1 → class scores
+            cls_scores.append(cls_out)
+
+            # Quality: piggyback on cls features
+            quality_out = self.quality_heads[i](cls_feat)
+            quality_scores.append(quality_out)
+
+            # Regression (unchanged)
+            reg_out = reg_branch(feat)
+            bbox_out = self.dfl(reg_out)
+            bbox_preds.append(bbox_out)
+
+            if return_raw_reg:
+                raw_reg_outputs.append(reg_out)
+
+        if return_raw_reg:
+            return cls_scores, bbox_preds, quality_scores, raw_reg_outputs
+        return cls_scores, bbox_preds, quality_scores
+
+    def get_quality_exp(self):
+        return self.quality_exp
+
+
+# =============================================================================
+# Quality-aware post-processing
+# =============================================================================
+
+def quality_aware_postprocess(cls_scores, bbox_preds, quality_scores,
+                               conf_threshold=0.25, max_det=300,
+                               quality_exp=1.0):
+    """
+    Post-process with quality-aware scoring: score = sigmoid(cls) × sigmoid(quality)^γ.
+
+    This replaces pure class confidence with a calibrated score that accounts
+    for localization quality. Well-localized boxes get higher scores;
+    poorly-localized boxes are suppressed even if class confidence is high.
+
+    Args:
+        cls_scores: list of [B, num_classes, H, W]
+        bbox_preds: list of [B, 4, H, W]
+        quality_scores: list of [B, 1, H, W]
+        conf_threshold: minimum quality-aware score to keep
+        max_det: maximum detections per image
+        quality_exp: exponent γ for quality gating
+
+    Returns:
+        list of (boxes, scores, class_ids) per image in batch
+    """
+    batch_size = cls_scores[0].shape[0]
+    results = []
+
+    all_cls = []
+    all_bbox = []
+    all_quality = []
+    for cls, bbox, qual in zip(cls_scores, bbox_preds, quality_scores):
+        b, c, h, w = cls.shape
+        all_cls.append(cls.permute(0, 2, 3, 1).reshape(b, -1, c))
+        all_bbox.append(bbox.permute(0, 2, 3, 1).reshape(b, -1, 4))
+        all_quality.append(qual.permute(0, 2, 3, 1).reshape(b, -1, 1))
+
+    all_cls = torch.cat(all_cls, dim=1).sigmoid()         # [B, N, C]
+    all_bbox = torch.cat(all_bbox, dim=1)                   # [B, N, 4]
+    all_quality = torch.cat(all_quality, dim=1).sigmoid()   # [B, N, 1]
+
+    for b in range(batch_size):
+        cls_prob = all_cls[b]                    # [N, C]
+        quality = all_quality[b]                 # [N, 1]
+
+        # Quality-aware scoring: cls × quality^γ
+        quality_gated = quality.pow(quality_exp)  # [N, 1]
+        calibrated_scores = cls_prob * quality_gated  # [N, C]
+
+        scores, class_ids = calibrated_scores.max(dim=-1)  # [N], [N]
+
+        keep = scores > conf_threshold
+        scores = scores[keep]
+        class_ids = class_ids[keep]
+        boxes = all_bbox[b][keep]
+
+        if len(scores) > max_det:
+            _, top_idx = scores.topk(max_det)
+            scores = scores[top_idx]
+            class_ids = class_ids[top_idx]
+            boxes = boxes[top_idx]
+
+        results.append((boxes, scores, class_ids))
+
+    return results
+
+
+# Experimental: GroupNorm-based quality head
+# Added by build script
+
+class QualityDecoupledHead(nn.Module):
+    def __init__(self, num_classes=80, channels=None, reg_max=16,
+                 quality_exp=1.0, gn_groups=8):
+        super().__init__()
+        self.num_classes = num_classes
+        self.reg_max = reg_max
+        self.quality_exp = quality_exp
+        self.channels = channels or [256, 256, 256]
+        self.shared_stems = nn.ModuleList()
+        self.cls_convs = nn.ModuleList()
+        self.cls_outputs = nn.ModuleList()
+        self.reg_convs = nn.ModuleList()
+        self.reg_outputs = nn.ModuleList()
+        self.quality_convs = nn.ModuleList()
+        self.quality_outputs = nn.ModuleList()
+        for ch in self.channels:
+            g = min(gn_groups, ch)
+            stem = nn.Sequential(
+                nn.Sequential(
+                    nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+                    nn.GroupNorm(num_groups=g, num_channels=ch),
+                    nn.SiLU(inplace=True),
+                ),
+                nn.Sequential(
+                    nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+                    nn.GroupNorm(num_groups=g, num_channels=ch),
+                    nn.SiLU(inplace=True),
+                ),
+            )
+            self.shared_stems.append(stem)
+            self.cls_convs.append(nn.Sequential(
+                nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+                nn.GroupNorm(num_groups=g, num_channels=ch),
+                nn.SiLU(inplace=True),
+            ))
+            self.cls_outputs.append(nn.Conv2d(ch, num_classes, 1))
+            self.reg_convs.append(nn.Sequential(
+                nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+                nn.GroupNorm(num_groups=g, num_channels=ch),
+                nn.SiLU(inplace=True),
+            ))
+            self.reg_outputs.append(nn.Conv2d(ch, 4 * reg_max, 1))
+            q_ch = max(ch // 2, 16)
+            g_q = min(gn_groups, q_ch)
+            self.quality_convs.append(nn.Sequential(
+                nn.Conv2d(ch, q_ch, 3, padding=1, bias=False),
+                nn.GroupNorm(num_groups=g_q, num_channels=q_ch),
+                nn.SiLU(inplace=True),
+            ))
+            self.quality_outputs.append(nn.Conv2d(q_ch, 1, 1))
+        self.dfl = DFL(reg_max)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None: nn.init.constant_(m.bias, 0.0)
+        for o in self.cls_outputs: nn.init.constant_(o.bias, -4.0)
+        for o in self.quality_outputs: nn.init.constant_(o.bias, -1.0)
+
+    def forward(self, features, return_raw_reg=False):
+        cls_scores, bbox_preds, quality_scores = [], [], []
+        raw_reg_outputs = [] if return_raw_reg else None
+        for i, feat in enumerate(features):
+            s0 = self.shared_stems[i][0](feat)
+            s1 = self.shared_stems[i][1](s0)
+            stem_out = s1 + feat
+            cls_feat = self.cls_convs[i](stem_out)
+            cls_scores.append(self.cls_outputs[i](cls_feat))
+            reg_feat = self.reg_convs[i](stem_out)
+            reg_out = self.reg_outputs[i](reg_feat)
+            bbox_preds.append(self.dfl(reg_out))
+            q_feat = self.quality_convs[i](stem_out)
+            quality_scores.append(self.quality_outputs[i](q_feat))
+            if return_raw_reg: raw_reg_outputs.append(reg_out)
+        if return_raw_reg: return cls_scores, bbox_preds, quality_scores, raw_reg_outputs
+        return cls_scores, bbox_preds, quality_scores
+
+    def get_quality_exp(self): return self.quality_exp

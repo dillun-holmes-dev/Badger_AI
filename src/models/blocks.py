@@ -11,6 +11,7 @@ Every Badger model is built from these fundamental pieces:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 

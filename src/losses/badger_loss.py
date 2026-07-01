@@ -265,6 +265,7 @@ class TaskAlignedAssigner:
         target_bboxes = torch.zeros(batch_size, num_anchors, 4, device=device)
         target_scores = torch.zeros(batch_size, num_anchors, self.num_classes, device=device)
         fg_mask = torch.zeros(batch_size, num_anchors, dtype=torch.bool, device=device)
+        best_alignment = torch.full((batch_size, num_anchors), -1.0, device=device)
 
         if num_gt == 0:
             return target_labels, target_bboxes, target_scores, fg_mask
@@ -300,10 +301,17 @@ class TaskAlignedAssigner:
                     anchor_idx = topk_idx[gt_i, k]
                     score = topk_align[gt_i, k]
 
-                    target_labels[b, anchor_idx, gt_cls[gt_i]] = 1.0
-                    target_bboxes[b, anchor_idx] = gt_boxes[gt_i]
-                    target_scores[b, anchor_idx, gt_cls[gt_i]] = score
-                    fg_mask[b, anchor_idx] = True
+                    iou_val = iou[anchor_idx, gt_i].clamp(0, 1)
+                    # If multiple GTs select the same anchor, keep the match
+                    # with the stronger task-alignment score.
+                    if score >= best_alignment[b, anchor_idx]:
+                        target_labels[b, anchor_idx].zero_()
+                        target_scores[b, anchor_idx].zero_()
+                        target_labels[b, anchor_idx, gt_cls[gt_i]] = 1.0
+                        target_bboxes[b, anchor_idx] = gt_boxes[gt_i]
+                        target_scores[b, anchor_idx, gt_cls[gt_i]] = iou_val
+                        fg_mask[b, anchor_idx] = True
+                        best_alignment[b, anchor_idx] = score
 
         return target_labels, target_bboxes, target_scores, fg_mask
 
@@ -452,10 +460,13 @@ class SimOTAAssigner:
 
                 for anchor_idx in topk_indices:
                     iou_val = pair_wise_iou[anchor_idx, gt_idx]
-                    target_labels[b, anchor_idx, gt_cls[gt_idx]] = 1.0
-                    target_bboxes[b, anchor_idx] = gt_boxes[gt_idx]
-                    target_scores[b, anchor_idx, gt_cls[gt_idx]] = iou_val
-                    fg_mask[b, anchor_idx] = True
+                    if iou_val >= target_scores[b, anchor_idx].max():
+                        target_labels[b, anchor_idx].zero_()
+                        target_scores[b, anchor_idx].zero_()
+                        target_labels[b, anchor_idx, gt_cls[gt_idx]] = 1.0
+                        target_bboxes[b, anchor_idx] = gt_boxes[gt_idx]
+                        target_scores[b, anchor_idx, gt_cls[gt_idx]] = iou_val.clamp(0, 1)
+                        fg_mask[b, anchor_idx] = True
 
         return target_labels, target_bboxes, target_scores, fg_mask
 
@@ -481,15 +492,31 @@ class BadgerLoss(nn.Module):
     """
 
     def __init__(self, num_classes=80, box_weight=7.5, cls_weight=0.5,
-                 dfl_weight=1.5, label_smoothing=0.0, assigner='tal'):
+                 dfl_weight=1.5, quality_weight=1.0, label_smoothing=0.0,
+                 assigner='tal', box_loss_type='ciou'):
+        """
+        Args:
+            box_loss_type: 'ciou' (default), 'wiou', 'inner_iou',
+                          'focal_eiou', 'siou', 'iou'
+            quality_weight: weight for IoU quality prediction loss.
+                           Only used when quality_scores are provided to forward().
+                           Set to 0 to disable quality loss entirely.
+        """
         super().__init__()
         self.num_classes = num_classes
         self.box_weight = box_weight
         self.cls_weight = cls_weight
         self.dfl_weight = dfl_weight
+        self.quality_weight = quality_weight
         self.label_smoothing = label_smoothing
+        self.box_loss_type = box_loss_type
+
+        # WIoU state: running mean of IoU loss for outlier detection
+        self.register_buffer('wiou_iou_mean', torch.tensor(-1.0))  # -1 = uninitialized
+        self.wiou_momentum = 0.99
 
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.qfl_beta = 2.0
 
         # Choose label assigner
         if assigner == 'simota':
@@ -531,9 +558,13 @@ class BadgerLoss(nn.Module):
         Decode predicted bbox distributions into actual coordinates.
 
         For each anchor point, the model predicts offsets (left, top, right,
-        bottom) in pixel units. This decodes them to (cx, cy, w, h) format.
+        bottom) in feature-stride units. This decodes them to pixel-space
+        (cx, cy, w, h) boxes.
         """
         # pred_bboxes: [B, N_total, 4] — already passed through DFL
+        stride_scale = strides.view(1, -1, 1)
+        pred_bboxes = pred_bboxes * stride_scale
+
         # Convert from (left, top, right, bottom) to (cx, cy, w, h)
         lt = pred_bboxes[..., :2]  # left, top
         rb = pred_bboxes[..., 2:]  # right, bottom
@@ -549,19 +580,25 @@ class BadgerLoss(nn.Module):
 
         return torch.cat([cxcy, wh], dim=-1)
 
-    def forward(self, cls_scores, bbox_preds, targets, img_size):
+    def forward(self, cls_scores, bbox_preds, targets, img_size,
+                raw_reg_preds=None, quality_scores=None, reg_max=16):
         """
         Compute the full Badger loss.
 
         Args:
             cls_scores: list of [B, C, H_i, W_i] — class logits per scale
-            bbox_preds: list of [B, 4, H_i, W_i] — decoded boxes per scale
+            bbox_preds: list of [B, 4, H_i, W_i] — DFL-decoded box offsets per scale
             targets: [num_gt, 6] — (batch_idx, cls, x, y, w, h) normalized
             img_size: (H, W) of input images
+            raw_reg_preds: list of [B, 4*reg_max, H_i, W_i] — raw reg logits
+                          (before DFL softmax), needed for DFL loss. If None,
+                          DFL loss is skipped.
+            quality_scores: list of [B, 1, H_i, W_i] — quality/IoU logits per scale.
+                           If None, quality loss is skipped (backward compatible).
 
         Returns:
             total_loss: combined loss (scalar)
-            loss_dict: {'box': ..., 'cls': ..., 'dfl': ...} for logging
+            loss_dict: {'box': ..., 'cls': ..., 'dfl': ..., 'quality': ...} for logging
         """
         batch_size = cls_scores[0].shape[0]
         device = cls_scores[0].device
@@ -570,16 +607,22 @@ class BadgerLoss(nn.Module):
         # Flatten predictions from all scales
         all_cls = []
         all_bbox = []
+        all_raw_reg = [] if raw_reg_preds is not None else None
 
         for i, (cls, bbox) in enumerate(zip(cls_scores, bbox_preds)):
             b, c, h, w = cls.shape
             # Reshape: [B, C, H, W] → [B, H*W, C]
             all_cls.append(cls.permute(0, 2, 3, 1).reshape(b, -1, c))
-            # Reshape: [B, 4, H, W] → [B, H*W, 4]
+            # Reshape: [B, 4, H, W] → [B, H*W, 4] (already DFL-decoded offsets)
             all_bbox.append(bbox.permute(0, 2, 3, 1).reshape(b, -1, 4))
+            if raw_reg_preds is not None:
+                raw = raw_reg_preds[i]  # [B, 4*reg_max, H, W]
+                all_raw_reg.append(raw.permute(0, 2, 3, 1).reshape(b, -1, 4 * reg_max))
 
         all_cls = torch.cat(all_cls, dim=1)    # [B, N_total, num_classes]
         all_bbox = torch.cat(all_bbox, dim=1)   # [B, N_total, 4]
+        if all_raw_reg is not None:
+            all_raw_reg = torch.cat(all_raw_reg, dim=1)  # [B, N_total, 4*reg_max]
 
         # Get anchor points and strides
         feature_shapes = [(cls.shape[2], cls.shape[3]) for cls in cls_scores]
@@ -588,8 +631,17 @@ class BadgerLoss(nn.Module):
         )
         anchor_points = anchor_points.unsqueeze(0)  # [1, N_total, 2]
 
-        # Decode boxes
+        # Decode boxes from DFL offsets. DFL returns bin expectations; the bins
+        # represent distance in stride units, then decode to image pixels.
         decoded_bboxes = self._decode_bboxes(all_bbox, anchor_points, strides_tensor)
+
+        # Normalize decoded boxes to [0,1] range for loss computation
+        # (target boxes from assigner are already normalized)
+        img_h, img_w = img_size
+        decoded_bboxes[..., 0] = decoded_bboxes[..., 0] / img_w  # cx
+        decoded_bboxes[..., 1] = decoded_bboxes[..., 1] / img_h  # cy
+        decoded_bboxes[..., 2] = decoded_bboxes[..., 2] / img_w  # w
+        decoded_bboxes[..., 3] = decoded_bboxes[..., 3] / img_h  # h
 
         # Apply Task Aligned Assigner
         num_gt = len(targets)
@@ -603,38 +655,221 @@ class BadgerLoss(nn.Module):
             num_gt
         )
 
-        # --- 1. Classification Loss (Binary Cross-Entropy) ---
-        # Apply label smoothing: target is 1-ε for positives, ε for negatives
+        # --- 1. Classification Loss (quality focal) ---
+        # Modern dense detectors rank boxes better when class confidence encodes
+        # localization quality. Positives use IoU as the soft class target;
+        # negatives stay zero and are focal-weighted to handle imbalance.
         if self.label_smoothing > 0:
-            target_cls_smooth = target_labels * (1 - self.label_smoothing) + \
-                                (1 - target_labels) * self.label_smoothing / self.num_classes
+            target_cls_smooth = target_scores * (1 - self.label_smoothing)
         else:
-            target_cls_smooth = target_labels
+            target_cls_smooth = target_scores
 
-        cls_loss = self.bce(all_cls, target_cls_smooth).mean()
+        cls_loss = self._quality_focal_loss(all_cls, target_cls_smooth)
 
-        # --- 2. Box Loss (CIoU) — only on foreground ---
+        # --- 2. Box Loss (selectable: CIoU, WIoU, Inner-IoU, etc.) ---
+        # --- 3. DFL Loss — Distribution Focal Loss on raw distributions ---
         if fg_mask.sum() > 0:
             pred_boxes_fg = decoded_bboxes[fg_mask]
             target_boxes_fg = target_bboxes[fg_mask]
-            box_loss = ciou_loss(pred_boxes_fg, target_boxes_fg)
-            dfl_loss_val = torch.tensor(0.0, device=device)  # Simplified DFL
+            box_loss = self._compute_box_loss(pred_boxes_fg, target_boxes_fg)
+
+            # DFL loss: penalize the distribution for not peaking at the true offset
+            if all_raw_reg is not None:
+                # Target offsets in stride units, clamped to [0, reg_max-1]
+                # anchor_points: [1, N_total, 2] in pixel coords
+                # target_bboxes: [B, N_total, 4] in normalized (cx, cy, w, h)
+                target_ltrb = self._compute_target_ltrb(
+                    target_bboxes[fg_mask],
+                    anchor_points.expand(batch_size, -1, -1)[fg_mask],
+                    strides_tensor.view(1, -1, 1).expand(batch_size, -1, -1)[fg_mask],
+                    img_size,
+                    reg_max=reg_max
+                )
+                dfl_loss_val = dfl_loss(all_raw_reg[fg_mask], target_ltrb, reg_max=reg_max)
+            else:
+                dfl_loss_val = torch.tensor(0.0, device=device)
         else:
             box_loss = torch.tensor(0.0, device=device)
             dfl_loss_val = torch.tensor(0.0, device=device)
 
-        # --- 3. Combined Loss ---
+        # --- 4. Quality Loss — IoU prediction calibration ---
+        # Teaches the quality branch to predict the actual IoU of each detection.
+        # For matched (fg) anchors: target = IoU between pred box and assigned GT
+        # For unmatched (bg) anchors: target = 0 (no object → zero quality)
+        if quality_scores is not None and self.quality_weight > 0:
+            quality_loss = self._compute_quality_loss(
+                quality_scores, fg_mask, target_scores, batch_size
+            )
+        else:
+            quality_loss = torch.tensor(0.0, device=device)
+
+        # --- 5. Combined Loss ---
         total_loss = (
             self.box_weight * box_loss +
             self.cls_weight * cls_loss +
-            self.dfl_weight * dfl_loss_val
+            self.dfl_weight * dfl_loss_val +
+            self.quality_weight * quality_loss
         )
 
         loss_dict = {
             'box': box_loss.detach().item(),
             'cls': cls_loss.detach().item(),
             'dfl': dfl_loss_val.detach().item(),
+            'quality': quality_loss.detach().item() if isinstance(quality_loss, torch.Tensor) else quality_loss,
             'total': total_loss.detach().item()
         }
 
         return total_loss, loss_dict
+
+    def _compute_quality_loss(self, quality_scores, fg_mask, target_scores,
+                               batch_size):
+        """
+        Quality prediction loss — teaches the quality branch to predict IoU.
+
+        Uses Smooth L1 loss on matched (foreground) predictions only.
+        Target: actual IoU between predicted box and assigned GT.
+
+        Unlike BCE (which treats IoU as binary), Smooth L1 is appropriate
+        for continuous regression targets. Background anchors are ignored
+        since they'll be filtered by the class score anyway.
+
+        Args:
+            quality_scores: list of [B, 1, H_i, W_i] — quality logits per scale
+            fg_mask: [B, N_total] — which anchors are matched to a GT
+            target_scores: [B, N_total, num_classes] — soft class targets with IoU
+            batch_size: int
+
+        Returns:
+            quality_loss: scalar
+        """
+        if fg_mask.sum() == 0:
+            return torch.tensor(0.0, device=fg_mask.device)
+
+        # Flatten quality scores from all scales
+        all_quality = []
+        for q in quality_scores:
+            all_quality.append(q.permute(0, 2, 3, 1).reshape(batch_size, -1, 1))
+        all_quality = torch.cat(all_quality, dim=1).squeeze(-1)  # [B, N_total]
+
+        # IoU target from target_scores (only non-zero for matched anchors)
+        iou_target = target_scores.max(dim=-1)[0]  # [B, N_total]
+
+        # Only compute loss on foreground (matched) predictions
+        # Apply sigmoid to quality logits since targets are in [0, 1]
+        pred_quality = all_quality[fg_mask].sigmoid()
+        target_iou = iou_target[fg_mask]
+
+        # Smooth L1 loss — robust to outliers, smooth gradient at zero
+        quality_loss = F.smooth_l1_loss(pred_quality, target_iou)
+
+        return quality_loss
+
+    def _quality_focal_loss(self, logits, target_scores):
+        """
+        Quality Focal Loss for dense detection confidence calibration.
+
+        The target is continuous: IoU for the matched class, 0 otherwise.
+        This teaches inference scores to mean "class is present and localized
+        well", which makes thresholding/NMS much less noisy than plain BCE.
+        """
+        pred_scores = logits.sigmoid()
+        bce = self.bce(logits, target_scores)
+        scale = (target_scores - pred_scores).abs().pow(self.qfl_beta)
+        loss = bce * scale
+        normalizer = target_scores.sum().clamp(min=1.0)
+        return loss.sum() / normalizer
+
+    def _compute_target_ltrb(self, target_boxes_cxcywh, anchor_points,
+                             anchor_strides, img_size, reg_max=16):
+        """
+        Compute target (left, top, right, bottom) offsets from anchor points.
+
+        The DFL module predicts bin offsets in [0, reg_max-1]. Each bin is one
+        feature stride, so pixel offsets are divided by the matching stride
+        before applying DFL.
+
+        Args:
+            target_boxes_cxcywh: [N, 4] — GT boxes in normalized (cx, cy, w, h)
+            anchor_points: [N, 2] — anchor point coordinates in pixel space
+            anchor_strides: [N, 1] — stride for each anchor point
+            img_size: (H, W) tuple
+
+        Returns:
+            target_ltrb: [N, 4] — stride-normalized offsets for L/T/R/B
+        """
+        img_h, img_w = img_size
+
+        # Convert GT from normalized to pixel coords
+        gt_cx = target_boxes_cxcywh[:, 0] * img_w
+        gt_cy = target_boxes_cxcywh[:, 1] * img_h
+        gt_w  = target_boxes_cxcywh[:, 2] * img_w
+        gt_h  = target_boxes_cxcywh[:, 3] * img_h
+
+        gt_x1 = gt_cx - gt_w / 2
+        gt_y1 = gt_cy - gt_h / 2
+        gt_x2 = gt_cx + gt_w / 2
+        gt_y2 = gt_cy + gt_h / 2
+
+        anchor_x = anchor_points[:, 0]
+        anchor_y = anchor_points[:, 1]
+
+        # Pixel offsets from anchor to GT edges
+        left   = anchor_x - gt_x1    # positive if anchor is right of GT left edge
+        top    = anchor_y - gt_y1
+        right  = gt_x2 - anchor_x    # positive if GT right edge is right of anchor
+        bottom = gt_y2 - anchor_y
+
+        target_ltrb = torch.stack([left, top, right, bottom], dim=-1)
+        target_ltrb = target_ltrb / anchor_strides.clamp(min=1.0)
+
+        # Clamp to valid range [0, reg_max-1] (16 bins for default Badger)
+        target_ltrb = target_ltrb.clamp(0, reg_max - 1)
+
+        return target_ltrb
+
+    def _compute_box_loss(self, pred_boxes, target_boxes):
+        """
+        Dispatch to the selected box loss function.
+
+        Supported types:
+          - 'ciou': Complete IoU (default, stable)
+          - 'wiou': Wise-IoU v3 (+0.5-0.8 AP, dynamic focusing)
+          - 'inner_iou': Inner-IoU (+0.3-0.5 AP, scale-aware)
+          - 'focal_eiou': Focal-EIoU (+0.3-0.5 AP, hard-sample focus)
+          - 'siou': SCYLLA-IoU (angle-aware)
+          - 'iou': Plain IoU loss (fastest, least accurate)
+        """
+        if self.box_loss_type == 'wiou':
+            from .advanced_losses import wiou_v3_loss
+            # Initialize running mean on first call
+            if self.wiou_iou_mean < 0:
+                loss, iou_mean = wiou_v3_loss(pred_boxes, target_boxes, iou_mean=None)
+                self.wiou_iou_mean = iou_mean.detach()
+            else:
+                loss, iou_mean = wiou_v3_loss(pred_boxes, target_boxes,
+                                              iou_mean=self.wiou_iou_mean)
+                self.wiou_iou_mean = (self.wiou_momentum * self.wiou_iou_mean +
+                                      (1 - self.wiou_momentum) * iou_mean.detach())
+            return loss
+
+        elif self.box_loss_type == 'inner_iou':
+            from .advanced_losses import inner_iou_loss
+            return inner_iou_loss(pred_boxes, target_boxes, inner_scale=0.75,
+                                  iou_type='ciou')
+
+        elif self.box_loss_type == 'focal_eiou':
+            from .advanced_losses import focal_eiou_loss
+            return focal_eiou_loss(pred_boxes, target_boxes, gamma=0.5)
+
+        elif self.box_loss_type == 'siou':
+            from .advanced_losses import siou_loss
+            return siou_loss(pred_boxes, target_boxes)
+
+        elif self.box_loss_type == 'iou':
+            iou = bbox_iou(pred_boxes, target_boxes, xywh=False)
+            # Diagonal IoU
+            diag = torch.diag(iou) if iou.ndim == 2 else iou
+            return (1.0 - diag).mean()
+
+        else:  # default: ciou
+            return ciou_loss(pred_boxes, target_boxes)

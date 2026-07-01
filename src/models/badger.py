@@ -13,7 +13,7 @@ from .blocks import (Conv, SPPF, C2f, DFL, make_divisible,
                       fuse_model_reparam)
 from .backbone import CSPDarknet
 from .neck import PAFPN
-from .head import DecoupledHead
+from .head import DecoupledHead, DecoupledHeadWithQuality, QualityDecoupledHead
 
 
 class Badger(nn.Module):
@@ -32,15 +32,20 @@ class Badger(nn.Module):
       Post-processing       → [boxes, scores, class_ids]  final detections
     """
 
-    def __init__(self, num_classes=80, width_multiple=0.50, depth_multiple=0.33):
+    def __init__(self, num_classes=80, width_multiple=0.50, depth_multiple=0.33,
+                 head_type='decoupled', quality_exp=1.0):
         """
         Args:
             num_classes: number of object classes (COCO=80, VOC=20)
             width_multiple: channel scaling (0.25=nano, 0.50=small, 1.0=large)
             depth_multiple: layer scaling (0.33=nano/small, 1.0=large)
+            head_type: 'decoupled' (default), 'quality_decoupled' (tiny quality piggyback),
+                       'quality_gn' (GroupNorm + full quality branch, experimental)
+            quality_exp: exponent γ for quality gating during inference
+                         (only used when head_type='quality_decoupled')
 
         Common variants:
-            Badger-Nano:  width=0.25, depth=0.33  (~3M params)
+            Badger-Nano:  width=0.25, depth=0.33  (~1.9M params)
             Badger-Small: width=0.50, depth=0.33  (~11M params)
             Badger-Medium: width=0.75, depth=0.67  (~26M params)
             Badger-Large: width=1.00, depth=1.00  (~44M params)
@@ -62,27 +67,92 @@ class Badger(nn.Module):
         )
 
         # 3. Head — produces detections
-        self.head = DecoupledHead(
-            num_classes=num_classes,
-            channels=self.neck.out_channels
-        )
+        self.head_type = head_type
+        if head_type == 'quality_gn':
+            self.head = QualityDecoupledHead(
+                num_classes=num_classes,
+                channels=self.neck.out_channels,
+                quality_exp=quality_exp,
+            )
+        elif head_type == 'quality_decoupled':
+            self.head = DecoupledHeadWithQuality(
+                num_classes=num_classes,
+                channels=self.neck.out_channels,
+                quality_exp=quality_exp,
+            )
+        else:
+            self.head = DecoupledHead(
+                num_classes=num_classes,
+                channels=self.neck.out_channels
+            )
 
         self.num_classes = num_classes
         self._strides = [8, 16, 32]  # Downsampling factors for P3, P4, P5
 
-    def forward(self, x):
+    def forward(self, x, return_raw_reg=False):
         """
         Args:
             x: image tensor [B, 3, H, W], normalized to [0, 1]
+            return_raw_reg: if True, also return raw regression outputs
+                           (before DFL softmax) for DFL loss computation
 
         Returns:
-            cls_scores: list of [B, num_classes, H/8, W/8], [H/16, W/16], [H/32, W/32]
-            bbox_preds: list of [B, 4, H/8, W/8], [H/16, W/16], [H/32, W/32]
+            cls_scores: list of [B, num_classes, H_i, W_i]
+            bbox_preds: list of [B, 4, H_i, W_i]
+            raw_reg: list of [B, 4*reg_max, H_i, W_i] or None
+
+        Side effect:
+            self._last_quality_scores is set to the quality head output
+            (list of [B, 1, H_i, W_i]) when head_type is 'quality_decoupled'
+            or 'quality_gn', or None for standard head. Access this after
+            forward() to pass quality scores to the loss function.
         """
         features = self.backbone(x)
         fused_features = self.neck(features)
-        cls_scores, bbox_preds = self.head(fused_features)
-        return cls_scores, bbox_preds
+
+        if self.head_type in ('quality_decoupled', 'quality_gn'):
+            if return_raw_reg:
+                cls, bbox, quality, raw_reg = self.head(fused_features, return_raw_reg=True)
+                self._last_quality_scores = quality
+                return cls, bbox, raw_reg
+            else:
+                cls, bbox, quality = self.head(fused_features, return_raw_reg=False)
+                self._last_quality_scores = quality
+                return cls, bbox
+        else:
+            self._last_quality_scores = None
+            return self.head(fused_features, return_raw_reg=return_raw_reg)
+
+    def predict(self, x, conf_threshold=0.25, max_det=300):
+        """
+        Run inference with quality-aware post-processing.
+
+        Args:
+            x: image tensor [B, 3, H, W]
+            conf_threshold: minimum confidence score
+            max_det: maximum detections per image
+
+        Returns:
+            list of (boxes, scores, class_ids) per image
+        """
+        features = self.backbone(x)
+        fused_features = self.neck(features)
+
+        if self.head_type in ('quality_decoupled', 'quality_gn'):
+            from .head import quality_aware_postprocess
+            cls_scores, bbox_preds, quality_scores = self.head(fused_features)
+            return quality_aware_postprocess(
+                cls_scores, bbox_preds, quality_scores,
+                conf_threshold=conf_threshold, max_det=max_det,
+                quality_exp=self.head.get_quality_exp()
+            )
+        else:
+            from .head import nms_free_postprocess
+            cls_scores, bbox_preds = self.head(fused_features)
+            return nms_free_postprocess(
+                cls_scores, bbox_preds,
+                conf_threshold=conf_threshold, max_det=max_det
+            )
 
     def get_strides(self):
         """Return stride for each detection scale (pixels in input per pixel in feature)."""
@@ -95,7 +165,8 @@ class Badger(nn.Module):
         return total, trainable
 
 
-def create_model(variant='badger-s', num_classes=80, pretrained=False):
+def create_model(variant='badger-s', num_classes=80, pretrained=False,
+                  head_type='decoupled', quality_exp=1.0):
     """
     Factory function to create Badger models.
 
@@ -103,6 +174,8 @@ def create_model(variant='badger-s', num_classes=80, pretrained=False):
         variant: 'badger-n', 'badger-s', 'badger-m', 'badger-l', 'badger-x'
         num_classes: number of classes for your dataset
         pretrained: load pretrained weights
+        head_type: 'decoupled' (default), 'quality_decoupled', or 'quality_gn' (experimental)
+        quality_exp: exponent for quality gating (only for quality_decoupled head)
 
     Returns:
         Badger model instance
@@ -119,7 +192,8 @@ def create_model(variant='badger-s', num_classes=80, pretrained=False):
         raise ValueError(f"Unknown variant '{variant}'. Options: {list(variants.keys())}")
 
     width, depth = variants[variant]
-    model = Badger(num_classes=num_classes, width_multiple=width, depth_multiple=depth)
+    model = Badger(num_classes=num_classes, width_multiple=width, depth_multiple=depth,
+                   head_type=head_type, quality_exp=quality_exp)
 
     if pretrained:
         # TODO: Load pretrained weights

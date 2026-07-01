@@ -72,9 +72,13 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, scaler, device, epoch
 
         # Mixed precision forward pass
         with torch.autocast(device_type='cuda' if 'cuda' in device else 'cpu'):
-            cls_scores, bbox_preds = model(images)
+            cls_scores, bbox_preds, raw_reg = model(images, return_raw_reg=True)
             img_size = images.shape[-2:]
-            loss, loss_dict = loss_fn(cls_scores, bbox_preds, targets, img_size)
+            # Pass quality scores if available (quality_decoupled head)
+            quality_scores = getattr(model, '_last_quality_scores', None)
+            loss, loss_dict = loss_fn(cls_scores, bbox_preds, targets, img_size,
+                                       raw_reg_preds=raw_reg,
+                                       quality_scores=quality_scores)
 
         # Backward pass
         optimizer.zero_grad()
@@ -89,6 +93,7 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, scaler, device, epoch
             'loss': f'{loss.item():.3f}',
             'box': f'{loss_dict["box"]:.3f}',
             'cls': f'{loss_dict["cls"]:.3f}',
+            'dfl': f'{loss_dict.get("dfl", 0):.3f}',
         })
 
     avg_loss = total_loss / len(dataloader)
@@ -106,9 +111,12 @@ def validate(model, dataloader, loss_fn, device):
         images = images.to(device)
         targets = targets.to(device)
 
-        cls_scores, bbox_preds = model(images)
+        cls_scores, bbox_preds, raw_reg = model(images, return_raw_reg=True)
         img_size = images.shape[-2:]
-        loss, loss_dict = loss_fn(cls_scores, bbox_preds, targets, img_size)
+        quality_scores = getattr(model, '_last_quality_scores', None)
+        loss, loss_dict = loss_fn(cls_scores, bbox_preds, targets, img_size,
+                                   raw_reg_preds=raw_reg,
+                                   quality_scores=quality_scores)
 
         total_loss += loss.item()
 
@@ -146,15 +154,20 @@ def main():
 
     # Create model
     print("\nCreating model...")
+    head_type = cfg_model['head'].get('type', 'decoupled')
+    quality_exp = cfg_model['head'].get('quality_exp', 1.0)
     model = create_model(
         variant='badger-s',
-        num_classes=cfg_model['head']['num_classes']
+        num_classes=cfg_model['head']['num_classes'],
+        head_type=head_type,
+        quality_exp=quality_exp,
     )
     model = model.to(device)
 
     total_params, trainable_params = model.count_parameters()
     print(f"  Total parameters: {total_params:,}")
     print(f"  Trainable parameters: {trainable_params:,}")
+    print(f"  Head type: {head_type}")
 
     # Quick benchmark
     print("\nQuick benchmark before training:")
@@ -174,15 +187,17 @@ def main():
 
     # Loss function
     assigner = cfg_train.get('loss', {}).get('assigner', 'tal')
+    quality_weight = cfg_train.get('loss', {}).get('quality_weight', 1.0)
     loss_fn = BadgerLoss(
         num_classes=cfg_model['head']['num_classes'],
         box_weight=cfg_train['loss']['box_weight'],
         cls_weight=cfg_train['loss']['cls_weight'],
         dfl_weight=cfg_train['loss']['dfl_weight'],
+        quality_weight=quality_weight,
         label_smoothing=cfg_train.get('label_smoothing', 0.0),
         assigner=assigner
     )
-    print(f"  Loss assigner: {assigner}")
+    print(f"  Loss assigner: {assigner}, quality_weight: {quality_weight}")
 
     # Apply experiments
     if args.experiment:

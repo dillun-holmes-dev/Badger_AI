@@ -634,11 +634,14 @@ def compute_box_loss(pred_boxes, target_boxes, loss_type='wiou', xywh=True, **kw
         loss: scalar
     """
     if loss_type == 'wiou':
-        return wiou_loss(pred_boxes, target_boxes, xywh=xywh,
-                        mode=kwargs.get('wiou_mode', 'v3'))
+        loss, _ = wiou_v3_loss(pred_boxes, target_boxes,
+                               delta=kwargs.get('wiou_delta', 0.5),
+                               alpha=kwargs.get('wiou_alpha', 1.9))
+        return loss
     elif loss_type == 'inner_iou':
-        return inner_iou_loss(pred_boxes, target_boxes, xywh=xywh,
-                             ratio=kwargs.get('inner_ratio', 0.7))
+        return inner_iou_loss(pred_boxes, target_boxes,
+                             inner_scale=kwargs.get('inner_scale', 0.75),
+                             iou_type=kwargs.get('iou_type', 'ciou'))
     elif loss_type == 'focal_eiou':
         return focal_eiou_loss(pred_boxes, target_boxes, xywh=xywh,
                               gamma=kwargs.get('focal_gamma', 0.5))
