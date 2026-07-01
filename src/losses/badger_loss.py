@@ -231,10 +231,10 @@ class TaskAlignedAssigner:
     Implementation: Based on YOLOv8/Ultralytics TAL.
     """
 
-    def __init__(self, num_classes=80, topk=13, alpha=1.0, beta=6.0):
+    def __init__(self, num_classes=80, topk=10, alpha=0.5, beta=6.0):
         self.num_classes = num_classes
-        self.topk = topk        # k=13: empirical YOLOv8 default (not from TOOD)
-        self.alpha = alpha      # α=1.0: cls exponent (TOOD Table 3)
+        self.topk = topk        # k=10: Ultralytics default (cleaner training, fewer FP)
+        self.alpha = alpha      # α=0.5: Ultralytics default (IoU matters more than cls)
         self.beta = beta        # β=6.0: reg exponent (TOOD Table 3, β=6 optimal)
 
     @torch.no_grad()
@@ -493,7 +493,7 @@ class BadgerLoss(nn.Module):
 
     def __init__(self, num_classes=80, box_weight=7.5, cls_weight=0.5,
                  dfl_weight=1.5, quality_weight=1.0, label_smoothing=0.0,
-                 assigner='tal', box_loss_type='ciou'):
+                 assigner='tal', box_loss_type='ciou', use_vfl=False):
         """
         Args:
             box_loss_type: 'ciou' (default), 'wiou', 'inner_iou',
@@ -517,6 +517,7 @@ class BadgerLoss(nn.Module):
 
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
         self.qfl_beta = 2.0
+        self.use_vfl = use_vfl
 
         # Choose label assigner
         if assigner == 'simota':
@@ -664,7 +665,10 @@ class BadgerLoss(nn.Module):
         else:
             target_cls_smooth = target_scores
 
-        cls_loss = self._quality_focal_loss(all_cls, target_cls_smooth)
+        if self.use_vfl:
+            cls_loss = self._varifocal_loss(all_cls, target_cls_smooth, fg_mask)
+        else:
+            cls_loss = self._quality_focal_loss(all_cls, target_cls_smooth)
 
         # --- 2. Box Loss (selectable: CIoU, WIoU, Inner-IoU, etc.) ---
         # --- 3. DFL Loss — Distribution Focal Loss on raw distributions ---
@@ -776,6 +780,33 @@ class BadgerLoss(nn.Module):
         bce = self.bce(logits, target_scores)
         scale = (target_scores - pred_scores).abs().pow(self.qfl_beta)
         loss = bce * scale
+        normalizer = target_scores.sum().clamp(min=1.0)
+        return loss.sum() / normalizer
+
+    def _varifocal_loss(self, logits, target_scores, fg_mask, alpha=0.75, gamma=2.0):
+        """
+        Varifocal Loss — from Zhang et al., "VarifocalNet" (arXiv:2008.13367).
+
+        Better than QFL for dense detection because it explicitly separates
+        positive and negative sample weighting:
+          - Positives: weighted by IoU score (well-localized = higher weight)
+          - Negatives: weighted by α × p^γ (reduces easy-negative dominance)
+
+        This is what Ultralytics YOLOv8/v11 uses as its primary cls loss.
+        Reference implementation: ultralytics/utils/loss.py VarifocalLoss.
+        """
+        pred_scores = logits.sigmoid()
+        # Positives: -iou * log(p) * (1-p)^gamma
+        pos_loss = target_scores * F.binary_cross_entropy_with_logits(
+            logits, torch.ones_like(logits), reduction='none')
+        pos_loss = pos_loss * ((1 - pred_scores) ** gamma)
+        # Negatives: -alpha * log(1-p) * p^gamma
+        neg_loss = alpha * F.binary_cross_entropy_with_logits(
+            logits, torch.zeros_like(logits), reduction='none')
+        neg_loss = neg_loss * (pred_scores ** gamma)
+        # Only apply negative loss where fg_mask is False
+        neg_loss = neg_loss * (~fg_mask.unsqueeze(-1)).float()
+        loss = pos_loss + neg_loss
         normalizer = target_scores.sum().clamp(min=1.0)
         return loss.sum() / normalizer
 

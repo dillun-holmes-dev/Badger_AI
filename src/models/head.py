@@ -4,11 +4,18 @@ Detection heads for Badger.
 The head takes fused features from the neck and produces:
   1. Classification scores — "what object is this?"
   2. Bounding box coordinates — "where is it?"
+  3. Quality scores — "how good is this detection?" (optional)
 """
 
 import torch
 import torch.nn as nn
+import math
 from .blocks import Conv, DFL
+
+
+def bias_init_with_prob(prob=0.01):
+    """Initialize bias so sigmoid(bias) = prob. From RT-DETR / Ultralytics."""
+    return -math.log((1 - prob) / prob)
 
 
 class DecoupledHead(nn.Module):
@@ -54,9 +61,9 @@ class DecoupledHead(nn.Module):
         self._init_biases()
 
     def _init_biases(self):
-        """Initialize with small negative bias → models start conservative."""
+        """Initialize with RT-DETR/Ultralytics-style bias: sigmoid(bias) ≈ 0.01."""
         for cls_branch, reg_branch in zip(self.cls_branches, self.reg_branches):
-            nn.init.constant_(cls_branch[-1].bias, -4.0)
+            nn.init.constant_(cls_branch[-1].bias, bias_init_with_prob(0.01))
             nn.init.constant_(reg_branch[-1].bias, 0.0)
 
     def forward(self, features, return_raw_reg=False):
