@@ -22,7 +22,9 @@ from .blocks import (
 from .backbone import CSPDarknet
 from .neck import PAFPN
 from .neck_advanced import BiFPN, ASFF, NASFPN
-from .head import DecoupledHead, CoupledHead, DualHead, HungarianMatcher, nms_free_postprocess
+from .head import (DecoupledHead, CoupledHead, DualHead, HungarianMatcher,
+                     nms_free_postprocess, DecoupledHeadWithQuality,
+                     QualityDecoupledHead, quality_aware_postprocess)
 from .attention import WindowAttention, SwinBlock, GlobalTokenMixer, AttentionNeck
 from .badger import (Badger, create_model,
                        BadgerV2, BackboneV2, BiFPNNeck, DecoupledHeadV2,
