@@ -281,6 +281,12 @@ class TaskAlignedAssigner:
 
             gt_boxes = targets[gt_mask, 2:]   # [num_gt_b, 4] normalized
             gt_cls = targets[gt_mask, 1].long()  # [num_gt_b]
+            # Filter invalid GT boxes (zero width/height) — from Ultralytics TAL
+            valid_gt = (gt_boxes[:, 2] > 1e-6) & (gt_boxes[:, 3] > 1e-6)
+            if not valid_gt.any():
+                continue
+            gt_boxes = gt_boxes[valid_gt]
+            gt_cls = gt_cls[valid_gt]
 
             # Compute IoU between all predictions and all ground truths
             # pred_bboxes: [N_total, 4], gt_boxes: [num_gt_b, 4]
@@ -493,7 +499,7 @@ class BadgerLoss(nn.Module):
 
     def __init__(self, num_classes=80, box_weight=7.5, cls_weight=0.5,
                  dfl_weight=1.5, quality_weight=1.0, label_smoothing=0.0,
-                 assigner='tal', box_loss_type='ciou', use_vfl=False):
+                 assigner='tal', box_loss_type='ciou', use_vfl=True):
         """
         Args:
             box_loss_type: 'ciou' (default), 'wiou', 'inner_iou',
@@ -891,6 +897,10 @@ class BadgerLoss(nn.Module):
         elif self.box_loss_type == 'focal_eiou':
             from .advanced_losses import focal_eiou_loss
             return focal_eiou_loss(pred_boxes, target_boxes, gamma=0.5)
+
+        elif self.box_loss_type == 'giou':
+            from .advanced_losses import giou_loss
+            return giou_loss(pred_boxes, target_boxes)
 
         elif self.box_loss_type == 'siou':
             from .advanced_losses import siou_loss

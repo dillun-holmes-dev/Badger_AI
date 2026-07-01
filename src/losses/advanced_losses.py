@@ -655,3 +655,36 @@ def compute_box_loss(pred_boxes, target_boxes, loss_type='wiou', xywh=True, **kw
         raise ValueError(f"Unknown loss_type: {loss_type}. "
                         f"Options: ciou, wiou, inner_iou, focal_eiou, siou")
 
+
+
+def giou_loss(pred_boxes, target_boxes, xywh=True, eps=1e-7):
+    """Generalized IoU loss — from Deformable-DETR (Rezatofighi et al., CVPR 2019).
+    GIoU = IoU - |C minus (A u B)| / |C| where C is the smallest enclosing box.
+    More stable than CIoU for small/overlapping boxes."""
+    if xywh:
+        p_x1 = pred_boxes[...,0] - pred_boxes[...,2]/2
+        p_y1 = pred_boxes[...,1] - pred_boxes[...,3]/2
+        p_x2 = pred_boxes[...,0] + pred_boxes[...,2]/2
+        p_y2 = pred_boxes[...,1] + pred_boxes[...,3]/2
+        t_x1 = target_boxes[...,0] - target_boxes[...,2]/2
+        t_y1 = target_boxes[...,1] - target_boxes[...,3]/2
+        t_x2 = target_boxes[...,0] + target_boxes[...,2]/2
+        t_y2 = target_boxes[...,1] + target_boxes[...,3]/2
+    else:
+        p_x1,p_y1,p_x2,p_y2 = pred_boxes.chunk(4,dim=-1)
+        t_x1,t_y1,t_x2,t_y2 = target_boxes.chunk(4,dim=-1)
+    ix1 = torch.max(p_x1,t_x1); iy1 = torch.max(p_y1,t_y1)
+    ix2 = torch.min(p_x2,t_x2); iy2 = torch.min(p_y2,t_y2)
+    inter = (ix2-ix1).clamp(0) * (iy2-iy1).clamp(0)
+    p_area = (p_x2-p_x1) * (p_y2-p_y1)
+    t_area = (t_x2-t_x1) * (t_y2-t_y1)
+    union = p_area + t_area - inter + eps
+    iou = inter / union
+    cx1 = torch.min(p_x1,t_x1); cy1 = torch.min(p_y1,t_y1)
+    cx2 = torch.max(p_x2,t_x2); cy2 = torch.max(p_y2,t_y2)
+    c_area = (cx2-cx1) * (cy2-cy1) + eps
+    giou = iou - (c_area - union) / c_area
+    return (1 - giou).mean()
+
+# Register giou in the box loss dispatch
+import torch

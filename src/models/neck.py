@@ -53,7 +53,7 @@ class PAFPN(nn.Module):
 
         # --- Top-down pathway ---
         # P5 → upsample to P4 size
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
 
         # P5 → reduce channels → upsample → concat with P4
         self.top_down_conv1 = Conv(self.c5, self.reduce_channels, 1, 1)
