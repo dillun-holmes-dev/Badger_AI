@@ -1714,3 +1714,65 @@ class DyHead(nn.Module):
             reg_outputs.append(reg_out)
 
         return cls_outputs, reg_outputs
+
+# =============================================================================
+# DropPath / Stochastic Depth (from DINO/Deformable-DETR training recipes)
+# =============================================================================
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample. From timm / DINO training.
+    
+    Randomly drops entire residual branches during training. Acts as
+    a strong regularizer — each batch sees a different sub-network.
+    
+    Reference: Huang et al., "Deep Networks with Stochastic Depth" (ECCV 2016)
+    """
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x.div(keep_prob) * random_tensor
+
+
+# =============================================================================
+# CSPRepLayer — RepVGG-based CSP block (from RT-DETR)
+# =============================================================================
+
+class CSPRepLayer(nn.Module):
+    """Cross-Stage Partial layer with RepVGG blocks.
+    
+    Used in RT-DETR's HybridEncoder neck. Combines CSP split-merge
+    with RepVGG branches for: (a) multi-branch training richness,
+    (b) reparameterization to single conv at inference.
+    
+    Architecture:
+        Input -> 1x1 Conv -> split
+          path1: RepVGG blocks (sequential)
+          path2: identity
+        -> concat -> 1x1 Conv -> output
+    
+    At inference, RepVGG blocks fuse into single 3x3 convs.
+    """
+    def __init__(self, in_channels, out_channels, num_blocks=3,
+                 expansion=1.0, act='silu'):
+        super().__init__()
+        hidden_channels = int(out_channels * expansion)
+        self.cv1 = Conv(in_channels, hidden_channels, 1, 1)
+        self.cv2 = Conv(hidden_channels, out_channels, 1, 1)
+        self.blocks = nn.ModuleList([
+            RepVGGBlock(hidden_channels, hidden_channels, 3)
+            for _ in range(num_blocks)
+        ])
+
+    def forward(self, x):
+        y = self.cv1(x)
+        for block in self.blocks:
+            y = block(y)
+        return self.cv2(y)
