@@ -603,7 +603,8 @@ class SuperMind:
                  use_amp=True, use_ema=True, use_swa=False,
                  use_grad_clip=True, use_compile=False,
                  early_stopping_patience=50, box_loss_type='ciou',
-                 use_stability_controller=True):
+                 use_stability_controller=True,
+                 use_mosaic=False, use_mixup=False):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -619,6 +620,21 @@ class SuperMind:
         self.early_stopping_patience = early_stopping_patience
         self.box_loss_type = box_loss_type
         self.use_stability_controller = use_stability_controller
+        self.use_mosaic = use_mosaic
+        self.use_mixup = use_mixup
+
+        # Augmentation pipeline (from YOLO training recipe)
+        self.mosaic = None
+        self.mixup = None
+        if use_mosaic or use_mixup:
+            try:
+                from .augment import MosaicAugment, MixUpAugment
+                if use_mosaic:
+                    self.mosaic = MosaicAugment(size=640, num_tiles=4)
+                if use_mixup:
+                    self.mixup = MixUpAugment(alpha=0.5)
+            except ImportError:
+                pass
 
         # Try torch.compile for 30-50% speedup (PyTorch 2.0+)
         if self.use_compile and hasattr(torch, 'compile'):
@@ -1075,6 +1091,12 @@ class SuperMind:
         for images, targets in pbar:
             images = images.to(self.device)
             targets = targets.to(self.device)
+
+            # Mosaic + MixUp augmentation (YOLO training recipe, +1-2 AP)
+            if self.mosaic is not None and torch.rand(1).item() < 0.5:
+                images, targets = self.mosaic(images, targets)
+            if self.mixup is not None and torch.rand(1).item() < 0.3:
+                images, targets = self.mixup(images, targets)
 
             # Forward
             with torch.amp.autocast('cuda' if 'cuda' in str(self.device) else 'cpu',

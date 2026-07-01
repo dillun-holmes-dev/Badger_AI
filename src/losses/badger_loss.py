@@ -478,7 +478,156 @@ class SimOTAAssigner:
 
 
 # =============================================================================
-# 5. Combined Badger Loss
+# 5. ATSS — Adaptive Training Sample Selection (Zhang et al., CVPR 2020)
+# =============================================================================
+
+class ATSSAssigner:
+    """
+    ATSS: Adaptive Training Sample Selection — from Zhang et al., CVPR 2020.
+
+    Unlike TAL (fixed topk per GT) or SimOTA (per-GT cost threshold),
+    ATSS adapts the number of positives PER FPN LEVEL based on the
+    statistical distribution of IoU values.
+
+    Algorithm (per image):
+      1. For each GT, find the top-k anchors with highest IoU per FPN level
+      2. Compute mean μ and std σ of these top-k IoU values
+      3. Threshold: t_g = μ + σ (adaptive per GT)
+      4. Select anchors with IoU > t_g AND whose center is inside the GT box
+      5. If no anchor meets both criteria, take the single highest-IoU anchor
+
+    Key insight: Different FPN levels have different IoU distributions.
+    A fixed threshold (like TAL's topk=10) doesn't account for this.
+    ATSS finds the natural separation point between positive and negative
+    IoU values at each scale.
+
+    Paper results (ATSS Table 3, COCO):
+      FCOS + ATSS: 39.2 → 42.6 AP (+3.4 AP over standard FCOS assigner)
+      RetinaNet + ATSS: 38.4 → 41.5 AP (+3.1 AP)
+
+    Reference: Zhang et al., "Bridging the Gap Between Anchor-based and
+               Anchor-free Detection via Adaptive Training Sample Selection"
+               (CVPR 2020) — arXiv:1912.02424
+    """
+
+    def __init__(self, num_classes=80, topk=9):
+        self.num_classes = num_classes
+        self.topk = topk  # k=9 from ATSS paper (Section 3.2, Table 5 ablation)
+
+    @torch.no_grad()
+    def __call__(self, pred_scores, pred_bboxes, targets, anchors, strides,
+                 img_size, num_gt):
+        batch_size = pred_scores.shape[0]
+        num_anchors = pred_scores.shape[1]
+        device = pred_scores.device
+
+        target_labels = torch.zeros(batch_size, num_anchors, self.num_classes, device=device)
+        target_bboxes = torch.zeros(batch_size, num_anchors, 4, device=device)
+        target_scores = torch.zeros(batch_size, num_anchors, self.num_classes, device=device)
+        fg_mask = torch.zeros(batch_size, num_anchors, dtype=torch.bool, device=device)
+
+        if num_gt == 0:
+            return target_labels, target_bboxes, target_scores, fg_mask
+
+        # Separate anchor points by FPN level
+        n_per_level = []
+        for s in strides:
+            h, w = int(img_size[0] / s), int(img_size[1] / s)
+            n_per_level.append(h * w)
+
+        level_ranges = []
+        start = 0
+        for n in n_per_level:
+            level_ranges.append((start, start + n))
+            start += n
+
+        num_levels = len(strides)
+
+        for b in range(batch_size):
+            gt_mask = targets[:, 0] == b
+            if gt_mask.sum() == 0:
+                continue
+
+            gt_boxes = targets[gt_mask, 2:]
+            gt_cls = targets[gt_mask, 1].long()
+            valid_gt = (gt_boxes[:, 2] > 1e-6) & (gt_boxes[:, 3] > 1e-6)
+            if not valid_gt.any():
+                continue
+            gt_boxes = gt_boxes[valid_gt]
+            gt_cls = gt_cls[valid_gt]
+            num_gt_b = len(gt_cls)
+
+            iou = bbox_iou(pred_bboxes[b], gt_boxes)  # [N, M]
+
+            for gt_i in range(num_gt_b):
+                # Per-level top-k IoU selection
+                candidate_idxs = []
+                candidate_ious = []
+
+                for l in range(num_levels):
+                    start_l, end_l = level_ranges[l]
+                    level_iou = iou[start_l:end_l, gt_i]  # [n_l]
+                    topk_l = min(self.topk, len(level_iou))
+                    topk_iou, topk_idx = level_iou.topk(topk_l)
+                    candidate_idxs.append(topk_idx + start_l)
+                    candidate_ious.append(topk_iou)
+
+                if not candidate_ious:
+                    continue
+
+                all_ious = torch.cat(candidate_ious)
+                all_idxs = torch.cat(candidate_idxs)
+
+                # Adaptive threshold: μ + σ
+                mean_iou = all_ious.mean()
+                std_iou = all_ious.std()
+                threshold = mean_iou + std_iou
+
+                # Select anchors above threshold AND inside GT box
+                gt_cx = gt_boxes[gt_i, 0] * img_size[1]
+                gt_cy = gt_boxes[gt_i, 1] * img_size[0]
+                gt_w = gt_boxes[gt_i, 2] * img_size[1]
+                gt_h = gt_boxes[gt_i, 3] * img_size[0]
+                gt_x1 = gt_cx - gt_w / 2
+                gt_y1 = gt_cy - gt_h / 2
+                gt_x2 = gt_cx + gt_w / 2
+                gt_y2 = gt_cy + gt_h / 2
+
+                keep = all_ious > threshold
+                if keep.sum() == 0:
+                    # Fallback: take the single best IoU anchor
+                    best_idx_local = all_ious.argmax()
+                    keep = torch.zeros_like(all_ious, dtype=torch.bool)
+                    keep[best_idx_local] = True
+
+                # Center-in-GT check
+                for idx_local in keep.nonzero(as_tuple=False).flatten():
+                    anchor_idx = all_idxs[idx_local].item()
+                    ax = anchors[0, anchor_idx, 0].item()
+                    ay = anchors[0, anchor_idx, 1].item()
+                    if gt_x1 <= ax <= gt_x2 and gt_y1 <= ay <= gt_y2:
+                        iou_val = float(all_ious[idx_local])
+                        target_labels[b, anchor_idx].zero_()
+                        target_scores[b, anchor_idx].zero_()
+                        target_labels[b, anchor_idx, gt_cls[gt_i]] = 1.0
+                        target_bboxes[b, anchor_idx] = gt_boxes[gt_i]
+                        target_scores[b, anchor_idx, gt_cls[gt_i]] = iou_val
+                        fg_mask[b, anchor_idx] = True
+
+                # If nothing matched (center check failed), take best IoU
+                if not fg_mask[b].any():
+                    best_idx = all_idxs[all_ious.argmax()].item()
+                    iou_val = float(all_ious.max())
+                    target_labels[b, best_idx, gt_cls[gt_i]] = 1.0
+                    target_bboxes[b, best_idx] = gt_boxes[gt_i]
+                    target_scores[b, best_idx, gt_cls[gt_i]] = iou_val
+                    fg_mask[b, best_idx] = True
+
+        return target_labels, target_bboxes, target_scores, fg_mask
+
+
+# =============================================================================
+# 6. Combined Badger Loss
 # =============================================================================
 
 class BadgerLoss(nn.Module):
@@ -528,6 +677,8 @@ class BadgerLoss(nn.Module):
         # Choose label assigner
         if assigner == 'simota':
             self.assigner = SimOTAAssigner(num_classes=num_classes)
+        elif assigner == 'atss':
+            self.assigner = ATSSAssigner(num_classes=num_classes)
         else:
             self.assigner = TaskAlignedAssigner(num_classes=num_classes)
 

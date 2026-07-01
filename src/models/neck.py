@@ -8,7 +8,7 @@ deep layers). Badger uses a PA-FPN (Path Aggregation FPN).
 
 import torch
 import torch.nn as nn
-from .blocks import Conv, C2f
+from .blocks import Conv, C2f, CSPRepLayer, make_divisible
 
 
 class PAFPN(nn.Module):
@@ -36,18 +36,27 @@ class PAFPN(nn.Module):
       P5 ──────────────────┘
     """
 
-    def __init__(self, in_channels, width_multiple=0.5, depth_multiple=0.33):
+    def __init__(self, in_channels, width_multiple=0.5, depth_multiple=0.33,
+                 use_csprep=False):
         """
         Args:
             in_channels: list of input channels from backbone [c3, c4, c5]
-                         e.g., [256, 512, 1024] for YOLOv8s
+            use_csprep: if True, use CSPRepLayer (RepVGG-based, RT-DETR style)
+                       instead of C2f. Reparameterizable at inference for +speed.
         """
         super().__init__()
 
-        # Reduce channels to a consistent size
         self.reduce_channels = make_divisible(256 * width_multiple)
-
         n = lambda base: max(1, int(base * depth_multiple))
+        self.use_csprep = use_csprep
+
+        # Choose block type
+        if use_csprep:
+            self._fusion_block = lambda in_ch, out_ch, n_blocks: CSPRepLayer(
+                in_ch, out_ch, num_blocks=n_blocks)
+        else:
+            self._fusion_block = lambda in_ch, out_ch, n_blocks: C2f(
+                in_ch, out_ch, n_blocks, shortcut=False)
 
         self.c3, self.c4, self.c5 = in_channels
 
@@ -57,20 +66,24 @@ class PAFPN(nn.Module):
 
         # P5 → reduce channels → upsample → concat with P4
         self.top_down_conv1 = Conv(self.c5, self.reduce_channels, 1, 1)
-        self.top_down_c2f1 = C2f(self.reduce_channels + self.c4, self.reduce_channels, n(3), shortcut=False)
+        self.top_down_fuse1 = self._fusion_block(
+            self.reduce_channels + self.c4, self.reduce_channels, n(3))
 
         # P4' → reduce channels → upsample → concat with P3
         self.top_down_conv2 = Conv(self.reduce_channels, self.reduce_channels, 1, 1)
-        self.top_down_c2f2 = C2f(self.reduce_channels + self.c3, self.reduce_channels, n(3), shortcut=False)
+        self.top_down_fuse2 = self._fusion_block(
+            self.reduce_channels + self.c3, self.reduce_channels, n(3))
 
         # --- Bottom-up pathway ---
         # P3' → downsample → concat with P4'
         self.bottom_up_conv1 = Conv(self.reduce_channels, self.reduce_channels, 3, 2)
-        self.bottom_up_c2f1 = C2f(self.reduce_channels + self.reduce_channels, self.reduce_channels, n(3), shortcut=False)
+        self.bottom_up_fuse1 = self._fusion_block(
+            self.reduce_channels + self.reduce_channels, self.reduce_channels, n(3))
 
         # P4'' → downsample → concat with P5'
         self.bottom_up_conv2 = Conv(self.reduce_channels, self.reduce_channels, 3, 2)
-        self.bottom_up_c2f2 = C2f(self.reduce_channels + self.reduce_channels, self.reduce_channels, n(3), shortcut=False)
+        self.bottom_up_fuse2 = self._fusion_block(
+            self.reduce_channels + self.reduce_channels, self.reduce_channels, n(3))
 
         # Output channels (all same size after neck)
         self.out_channels = [self.reduce_channels, self.reduce_channels, self.reduce_channels]
@@ -91,24 +104,24 @@ class PAFPN(nn.Module):
         p5_reduced = self.top_down_conv1(p5)          # Reduce channels
         p5_up = self.upsample(p5_reduced)              # Upsample to P4 size
         p4_fused = torch.cat([p5_up, p4], dim=1)       # Concat
-        p4_out = self.top_down_c2f1(p4_fused)          # Fuse
+        p4_out = self.top_down_fuse1(p4_fused)          # Fuse
 
         # P4' pathway
         p4_reduced = self.top_down_conv2(p4_out)       # Reduce channels
         p4_up = self.upsample(p4_reduced)               # Upsample to P3 size
         p3_fused = torch.cat([p4_up, p3], dim=1)       # Concat
-        n3 = self.top_down_c2f2(p3_fused)              # ← P3 output
+        n3 = self.top_down_fuse2(p3_fused)              # ← P3 output
 
         # --- Bottom-up ---
         # P3 → P4
         n3_down = self.bottom_up_conv1(n3)             # Downsample
         n4_fused = torch.cat([n3_down, p4_out], dim=1) # Concat
-        n4 = self.bottom_up_c2f1(n4_fused)             # ← P4 output
+        n4 = self.bottom_up_fuse1(n4_fused)             # ← P4 output
 
         # P4 → P5
         n4_down = self.bottom_up_conv2(n4)             # Downsample
         n5_fused = torch.cat([n4_down, p5_reduced], dim=1)  # Concat
-        n5 = self.bottom_up_c2f2(n5_fused)             # ← P5 output
+        n5 = self.bottom_up_fuse2(n5_fused)             # ← P5 output
 
         return [n3, n4, n5]
 
