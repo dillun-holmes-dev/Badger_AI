@@ -1,0 +1,11 @@
+.git
+.agents
+.codex
+.venv
+__pycache__/
+**/__pycache__/
+data/
+output/
+predictions/
+onnx_engines/
+trt_engines/

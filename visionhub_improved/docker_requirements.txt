@@ -1,0 +1,30 @@
+# Docker-only dependency set for VisionHub.
+# The TensorRT Python binding is installed separately in Dockerfile and pinned
+# to the NVIDIA container's TensorRT release.
+
+opencv-python-headless
+transformers
+cloudpickle
+pycocotools
+xtcocotools
+omegaconf
+calflops
+iopath
+lapjv
+
+numpy==1.26.4
+
+tensorboard
+onnx
+onnxruntime
+onnxscript
+onnx2torch
+onnx2pytorch
+polygraphy
+onnxsim
+pycuda
+tqdm
+
+build
+twine 
+wheel

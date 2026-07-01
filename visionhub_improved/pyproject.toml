@@ -1,0 +1,134 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visionhub"
+version = "1.0.0"
+description = "Training, inference, export, and deployment tools for custom computer-vision models."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {file = "LICENSE"}
+authors = [
+  {name = "VisionHub Contributors"}
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "opencv-python-headless",
+  "transformers",
+  "cloudpickle",
+  "pycocotools",
+  "xtcocotools",
+  "omegaconf",
+  "calflops",
+  "iopath",
+  "tensorboard",
+  "tqdm",
+
+  # Python-version-specific NumPy pins.
+  # Python 3.8 cannot use NumPy 1.26+ or NumPy 2.x.
+  "numpy>=1.23.5,<1.25; python_version == '3.8'",
+  "numpy>=1.26.4,<2.0; python_version >= '3.9' and python_version < '3.12'",
+
+  "typing-extensions>=4.8; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+
+# ONNX export support.
+# Keep onnxsim out of this group because it commonly fails to build on Jetson/aarch64.
+export = [
+  "onnx",
+  "onnxruntime",
+  "onnxscript",
+  "onnx2torch",
+  "onnx2pytorch",
+]
+
+# Optional ONNX simplification.
+# Recommended on desktop x86_64, not Jetson.
+export-simplify = [
+  "onnxsim; platform_machine == 'x86_64'",
+]
+
+# TensorRT helper tooling.
+# TensorRT itself should usually come from JetPack on Jetson or the NVIDIA TensorRT container in Docker.
+tensorrt = [
+  "polygraphy",
+]
+
+# PyCUDA is useful for some TensorRT workflows, but it can be painful to build on Jetson.
+# Install only when you actually need it.
+tensorrt-pycuda = [
+  "pycuda",
+]
+
+# Linear assignment / matching helpers.
+# lapjv is intentionally not a base dependency because it can fail on Python 3.8 + Jetson/aarch64.
+tracking = [
+  "lap; python_version >= '3.8'",
+]
+
+# Fast lapjv path for desktop x86_64.
+# On Jetson, install lapjv manually with --no-build-isolation if you really need it.
+tracking-lapjv-x86 = [
+  "lapjv; python_version >= '3.9' and platform_machine == 'x86_64'",
+]
+
+notebook = [
+  "jupyter",
+  "notebook",
+]
+
+dev = [
+  "build",
+  "pytest",
+  "ruff",
+  "twine",
+]
+
+[project.scripts]
+# === Unified CLI (NEW — recommended) ===
+visionhub = "visionhub.cli.main:main"
+
+# === Legacy entry points (backward compatible) ===
+visionhub-train = "visionhub.cli.train:main"
+visionhub-train-classifier = "visionhub.cli.train_classifier:main"
+visionhub-train-detr-detect = "visionhub.cli.train_detr_detect:main"
+visionhub-train-rtmo-detect = "visionhub.cli.train_rtmo_detect:main"
+visionhub-train-rtmdet = "visionhub.cli.train_rtmdet:main"
+visionhub-train-rtmdet-detect = "visionhub.cli.train_rtmdet_detect:main"
+visionhub-train-rtmdetpose = "visionhub.cli.train_rtmdetpose:main"
+visionhub-export-onnx = "visionhub.cli.export_onnx:main"
+visionhub-export-classifier-onnx = "visionhub.cli.export_classifier_onnx:main"
+visionhub-export-tensorrt = "visionhub.cli.export_tensorrt:main"
+visionhub-infer-classifier = "visionhub.cli.infer_classifier:main"
+visionhub-infer-pose = "visionhub.cli.infer_pose:main"
+visionhub-infer-detr-detect = "visionhub.cli.infer_detr_detect:main"
+visionhub-infer-rtmo-detect = "visionhub.cli.infer_rtmo_detect:main"
+visionhub-infer-rtmdet-detect = "visionhub.cli.infer_rtmdet_detect:main"
+visionhub-model-info = "visionhub.cli.model_info:main"
+visionhub-benchmark-torch = "visionhub.cli.benchmark_torch:main"
+
+[tool.setuptools]
+py-modules = ["train"]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["visionhub*", "configs*", "tools*", "src*"]
+namespaces = true

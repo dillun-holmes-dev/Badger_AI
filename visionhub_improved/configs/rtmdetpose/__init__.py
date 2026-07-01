@@ -1,0 +1,1 @@
+"""RTMDet-Pose configuration modules."""

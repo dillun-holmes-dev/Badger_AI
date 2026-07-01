@@ -1,0 +1,16 @@
+include README.md
+include LICENSE
+include train.py
+graft visionhub
+graft src
+graft configs
+graft tools
+prune data
+prune output
+prune predictions
+prune onnx_engines
+prune trt_engines
+prune weights
+prune __pycache__
+exclude *.ipynb
+global-exclude __pycache__ *.py[cod]

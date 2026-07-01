@@ -1,0 +1,15 @@
+data/COCO2017
+output/
+official_weights/
+onnx_engines/
+trt_engines/
+clean_pth_files.py
+**/__pycache__/**
+examples/output/
+/data/
+predictions/
+.python-version
+.venv
+visionhub.egg-info
+build/
+dist/

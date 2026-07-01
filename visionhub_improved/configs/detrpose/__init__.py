@@ -1,0 +1,1 @@
+"""DETRPose configuration modules."""

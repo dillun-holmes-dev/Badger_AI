@@ -1,0 +1,5 @@
+# Docker-only workflow:
+# TensorRT comes from the NVIDIA base image.
+# Benchmark extras are included in docker_requirements.txt and installed by Dockerfile.
+pycuda
+tqdm
