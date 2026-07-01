@@ -58,7 +58,7 @@ class PAFPN(nn.Module):
             self._fusion_block = lambda in_ch, out_ch, n_blocks: C2f(
                 in_ch, out_ch, n_blocks, shortcut=False)
 
-        self.c3, self.c4, self.c5 = in_channels
+        self.c3, self.c4, self.c5 = in_channels[-3:]  # Always take last 3
 
         # --- Top-down pathway ---
         # P5 → upsample to P4 size
@@ -97,7 +97,7 @@ class PAFPN(nn.Module):
         Returns:
             [N3_out, N4_out, N5_out] — fused features at 3 scales
         """
-        p3, p4, p5 = features
+        p3, p4, p5 = features[-3:]  # Take P3, P4, P5 (ignore P2 if present)
 
         # --- Top-down ---
         # P5 pathway

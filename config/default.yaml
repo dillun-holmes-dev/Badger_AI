@@ -9,13 +9,16 @@ model:
   backbone:
     type: "cspdarknet"        # Options: cspdarknet, efficientnet, mobilenet, resnet
     depth_multiple: 0.33      # Scales number of layers (nano=0.33, small=0.33, medium=0.67, large=1.0)
-    width_multiple: 0.25       # Scales number of channels (nano=0.25, small=0.50, medium=0.75, large=1.0)
+    width_multiple: 0.25      # Scales number of channels (nano=0.25, small=0.50, medium=0.75, large=1.0)
     act: "silu"               # Activation: silu (Swish), relu, mish
+    use_p2: false             # Enable P2 (stride=4) for better small object detection
+    drop_path_rate: 0.0       # Stochastic depth (0.1 = mild regularization)
 
   # Neck: feature pyramid that fuses multi-scale features
   neck:
     type: "pafpn"             # Options: pafpn (Badger default), bifpn, panet
-    num_fpn_layers: 3         # Number of FPN output scales (P3, P4, P5)
+    use_csprep: false         # Use CSPRepLayer (RepVGG, RT-DETR style) instead of C2f
+    num_fpn_layers: 3         # Number of FPN output scales (3 or 4 with P2)
 
   # Head: detection head that predicts boxes and classes
   head:
@@ -50,13 +53,15 @@ training:
   lr_scheduler: "cosine"      # Options: cosine, step, plateau
   lr_final: 0.0001            # Final LR as fraction of initial (0.01 = 1%)
 
-  # Loss weights — tune these to balance the four loss components
+  # Loss weights — tune these to balance the loss components
   loss:
-    box_weight: 7.5           # CIoU box regression loss
-    cls_weight: 0.5           # BCE classification loss
-    dfl_weight: 1.5           # Distribution focal loss (anchor-free only)
-    quality_weight: 1.0       # IoU quality prediction loss (only for quality_decoupled head)
-    assigner: "tal"           # Label assigner: "tal" (YOLOv8-style) or "simota" (YOLOX-style)
+    box_weight: 7.5           # Box regression loss
+    cls_weight: 0.5           # Classification loss
+    dfl_weight: 1.5           # Distribution focal loss
+    quality_weight: 1.0       # IoU quality prediction loss (quality heads only)
+    use_vfl: true             # VarifocalLoss (Ultralytics) — TRUE for +0.3-0.5 AP
+    assigner: "tal"           # Label assigner: "tal" | "simota" | "atss"
+    box_loss_type: "ciou"     # Box loss: "ciou" | "giou" | "wiou" | "inner_iou" | "focal_eiou" | "siou"
 
   # Augmentation (applied during training)
   augmentation:
@@ -76,6 +81,8 @@ training:
   # Regularization
   dropout: 0.0                # Dropout in classification head
   label_smoothing: 0.0        # Label smoothing epsilon
+  drop_path_rate: 0.0         # Stochastic depth (0.0-0.2, DINO-style regularization)
+  grad_clip: 3.0              # Gradient clipping norm (DINO uses 3.0, was 10.0)
 
 data:
   # Path to your dataset YAML (COCO format expected)

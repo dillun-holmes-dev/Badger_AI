@@ -33,16 +33,18 @@ class Badger(nn.Module):
     """
 
     def __init__(self, num_classes=80, width_multiple=0.50, depth_multiple=0.33,
-                 head_type='decoupled', quality_exp=1.0):
+                 head_type='decoupled', quality_exp=1.0,
+                 use_p2=False, use_csprep=False, drop_path_rate=0.0):
         """
         Args:
             num_classes: number of object classes (COCO=80, VOC=20)
             width_multiple: channel scaling (0.25=nano, 0.50=small, 1.0=large)
             depth_multiple: layer scaling (0.33=nano/small, 1.0=large)
-            head_type: 'decoupled' (default), 'quality_decoupled' (tiny quality piggyback),
-                       'quality_gn' (GroupNorm + full quality branch, experimental)
-            quality_exp: exponent γ for quality gating during inference
-                         (only used when head_type='quality_decoupled')
+            head_type: 'decoupled' | 'quality_decoupled' | 'quality_gn'
+            quality_exp: exponent for quality gating
+            use_p2: enable P2 output (stride=4) for better small object detection
+            use_csprep: use CSPRepLayer (RepVGG) in neck instead of C2f
+            drop_path_rate: stochastic depth rate for regularization (0.0=off)
 
         Common variants:
             Badger-Nano:  width=0.25, depth=0.33  (~1.9M params)
@@ -56,14 +58,17 @@ class Badger(nn.Module):
         # 1. Backbone — extracts features at multiple scales
         self.backbone = CSPDarknet(
             width_multiple=width_multiple,
-            depth_multiple=depth_multiple
+            depth_multiple=depth_multiple,
+            use_p2=use_p2,
+            drop_path_rate=drop_path_rate,
         )
 
         # 2. Neck — fuses features across scales
         self.neck = PAFPN(
             in_channels=self.backbone.out_channels,
             width_multiple=width_multiple,
-            depth_multiple=depth_multiple
+            depth_multiple=depth_multiple,
+            use_csprep=use_csprep,
         )
 
         # 3. Head — produces detections
@@ -87,7 +92,8 @@ class Badger(nn.Module):
             )
 
         self.num_classes = num_classes
-        self._strides = [8, 16, 32]  # Downsampling factors for P3, P4, P5
+        self.use_p2 = use_p2
+        self._strides = [4, 8, 16, 32] if use_p2 else [8, 16, 32]
 
     def forward(self, x, return_raw_reg=False):
         """
@@ -166,7 +172,8 @@ class Badger(nn.Module):
 
 
 def create_model(variant='badger-s', num_classes=80, pretrained=False,
-                  head_type='decoupled', quality_exp=1.0):
+                  head_type='decoupled', quality_exp=1.0,
+                  use_p2=False, use_csprep=False, drop_path_rate=0.0):
     """
     Factory function to create Badger models.
 
@@ -174,8 +181,11 @@ def create_model(variant='badger-s', num_classes=80, pretrained=False,
         variant: 'badger-n', 'badger-s', 'badger-m', 'badger-l', 'badger-x'
         num_classes: number of classes for your dataset
         pretrained: load pretrained weights
-        head_type: 'decoupled' (default), 'quality_decoupled', or 'quality_gn' (experimental)
-        quality_exp: exponent for quality gating (only for quality_decoupled head)
+        head_type: 'decoupled' | 'quality_decoupled' | 'quality_gn'
+        quality_exp: exponent for quality gating
+        use_p2: enable P2 level for better small object detection
+        use_csprep: use CSPRepLayer (RepVGG) in neck — reparameterizable
+        drop_path_rate: stochastic depth rate (0.0=off, 0.1=mild, 0.2=strong)
 
     Returns:
         Badger model instance
@@ -193,7 +203,9 @@ def create_model(variant='badger-s', num_classes=80, pretrained=False,
 
     width, depth = variants[variant]
     model = Badger(num_classes=num_classes, width_multiple=width, depth_multiple=depth,
-                   head_type=head_type, quality_exp=quality_exp)
+                   head_type=head_type, quality_exp=quality_exp,
+                   use_p2=use_p2, use_csprep=use_csprep,
+                   drop_path_rate=drop_path_rate)
 
     if pretrained:
         # TODO: Load pretrained weights
